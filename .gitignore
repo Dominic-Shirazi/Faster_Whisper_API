@@ -57,3 +57,6 @@ pythonv/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Temp Files
+temp_recording.wav

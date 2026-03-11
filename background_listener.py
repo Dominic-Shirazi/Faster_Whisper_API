@@ -10,11 +10,16 @@ import pyperclip
 import tkinter as tk
 from tkinter import ttk
 import requests
+from dotenv import load_dotenv
+
+# Load env file in the child too
+load_dotenv()
 
 # Configuration
 SAMPLE_RATE = 44100
 CHANNELS = 1
 MAX_DURATION_MINS = 10
+LISTENER_RESTART_INTERVAL_MINS = int(os.environ.get("LISTENER_RESTART_INTERVAL_MINS", 10))
 WAV_OUTPUT_PATH = os.path.join(os.path.dirname(__file__), 'temp_recording.wav')
 API_URL = "http://127.0.0.1:5000/transcribe"
 
@@ -24,6 +29,7 @@ recording_data = []
 stream = None
 recording_start_time = 0
 overlay = None
+last_active_time = time.time()
 
 class LoadingOverlay:
     def __init__(self):
@@ -81,6 +87,12 @@ class LoadingOverlay:
     def hide_safe(self):
         self.root.after(0, self.hide)
 
+    def update_label(self, new_text):
+        self.label.config(text=new_text)
+
+    def update_label_safe(self, new_text):
+        self.root.after(0, lambda: self.update_label(new_text))
+
 def beep_start():
     winsound.Beep(1000, 60)
 
@@ -133,6 +145,15 @@ def timeout_monitor():
             break
         time.sleep(1)
 
+def idle_monitor():
+    while True:
+        time.sleep(10)
+        if not recording_active:
+            idle_mins = (time.time() - last_active_time) / 60.0
+            if idle_mins >= LISTENER_RESTART_INTERVAL_MINS:
+                print(f"[Listener] Idle for {LISTENER_RESTART_INTERVAL_MINS} minutes. Exiting to allow watchdog to restart.")
+                os._exit(0)
+
 def save_and_transcribe():
     global recording_data
     
@@ -161,7 +182,7 @@ def transcribe_and_paste():
     try:
         with open(WAV_OUTPUT_PATH, 'rb') as f:
             files = {'file': (os.path.basename(WAV_OUTPUT_PATH), f, 'audio/wav')}
-            response = requests.post(API_URL, files=files)
+            response = requests.post(API_URL, files=files, timeout=60)
             response.raise_for_status()
             
             data = response.json()
@@ -180,24 +201,39 @@ def transcribe_and_paste():
             keyboard.send('ctrl+v')
             print("[Listener] Pasted.")
         else:
-            print("[Listener] No text transcribed.")
+            if overlay:
+                overlay.update_label_safe("No speech detected.")
+                time.sleep(2)
             
     except Exception as e:
-        print(f"[Listener] Error during API transcription: {e}")
+        error_msg = f"API Error: {str(e)}"
+        print(f"[Listener] {error_msg}")
+        if overlay:
+            overlay.update_label_safe(error_msg)
+            time.sleep(3)
 
 def toggle_recording():
+    global last_active_time
+    last_active_time = time.time()
     if recording_active:
         stop_recording()
     else:
         start_recording()
 
 if __name__ == "__main__":
+    # Startup sound (Rising tone)
+    winsound.Beep(500, 100)
+    winsound.Beep(800, 100)
+
     # Initialize overlay
     overlay = LoadingOverlay()
     
     # Hotkey
     print(f"[Listener] Press ` (backtick) to start/stop recording (Max {MAX_DURATION_MINS} mins).")
     keyboard.add_hotkey('`', toggle_recording)
+    
+    # Start robust idle monitor
+    threading.Thread(target=idle_monitor, daemon=True).start()
     
     # Start GUI loop (replaces keyboard.wait)
     print("[Listener] Running...")

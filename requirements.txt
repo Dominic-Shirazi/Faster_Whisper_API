@@ -10,3 +10,4 @@ pyperclip
 pywin32
 tk
 python-multipart
+python-dotenv
