@@ -4,7 +4,7 @@
 
 I just wanted a tool where I could hit a button, "word vomit" my thoughts into a text field, and hit Enter—without worrying about whether it picked up what I was saying. This tool is designed to be completely invisible until it drops the finished, perfectly punctuated text into your clipboard.
 
-Running the `small` Whisper model on CUDA (using ~1.5GB of VRAM) with a cheap $12 used Blue microphone off eBay, this thing is _dang near perfect_. It handles long pauses and punctuation with zero issues. For how often I use it, it is worth every megabyte of VRAM.
+Running the `small` Whisper model on CUDA (using ~0.6GB of VRAM) with a cheap $12 used Blue microphone off eBay, this thing is _dang near perfect_. It handles long pauses and auto-punctuation with near-zero issues. For how often I use it, it is worth every megabyte of VRAM.Easily start/stop the service from a system tray icon (bottom right corner by your clock)
 
 ## Features
 
