@@ -4,6 +4,7 @@ import threading
 import sys
 import time
 import pystray
+import ctypes
 from PIL import Image, ImageDraw
 
 # State
@@ -57,9 +58,25 @@ def on_quit(icon, item):
     icon.stop()
     os._exit(0)
 
+def pause_api(icon, item):
+    print("[Watchdog] Requesting elevated pause of FasterWhisperAPI...")
+    # 0 = SW_HIDE (hides the cmd window, but UAC prompt still shows)
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", "/c net stop FasterWhisperAPI", None, 0)
+    icon.notify("Freeing VRAM... Waiting for Windows Service to stop.", "API Paused")
+
+def resume_api(icon, item):
+    print("[Watchdog] Requesting elevated resume of FasterWhisperAPI...")
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", "/c net start FasterWhisperAPI", None, 0)
+    icon.notify("Loading AI Model into VRAM...", "API Resumed")
+
 def setup_tray():
     icon_image = create_tray_icon()
-    menu = pystray.Menu(pystray.MenuItem('Quit Faster-Whisper Listener', on_quit))
+    menu = pystray.Menu(
+        pystray.MenuItem('Resume API (Load Model)', resume_api),
+        pystray.MenuItem('Pause API (Free VRAM)', pause_api),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Quit Faster-Whisper Listener', on_quit)
+    )
     icon = pystray.Icon("faster_whisper_listener", icon_image, "Faster-Whisper Listener", menu)
     
     # Start the subprocess loop in a background daemon thread
