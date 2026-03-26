@@ -97,7 +97,7 @@ This is the recommended way to use the app for a seamless experience.
   2. Find the file named `install_service.ps1`.
   3. **Right-click** `install_service.ps1` and select **"Run with PowerShell"**.
      - _(If it asks for Administrator permissions or says "Do you want to allow this app to make changes", click **Yes**)._
-     - _(Alternative: Click the Start button, type "PowerShell", right-click it and choose "Run as Administrator". Then type `cd C:\Users\persi\Documents\Faster_Whisper_API` and hit enter, then type `.\install_service.ps1` and hit enter)._
+     - _(Alternative: Click the Start button, type "PowerShell", right-click it and choose "Run as Administrator". Then type `cd C:\path\to\Faster_Whisper_API\scripts` and hit enter, then type `.\install_service.ps1` and hit enter)._
   4. Follow the prompts in the blue window until it says "Service installed successfully".
   5. Open your `.env` file (notepad is fine) and change `API_VISIBLE=true` to `API_VISIBLE=false`. Save it.
   6. Double-click `LAUNCHER.bat`. From now on, you will only see a tiny red circle in your System Tray (by the clock), which manages the invisible background listener.
