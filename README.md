@@ -1,16 +1,33 @@
 # Faster Whisper API & Background Listener
 
-**Why I built this:** I got sick of poor transcription services, and I was tired of manually dictating punctuation. Worse, watching words appear on-screen in real-time broke my train of thought, especially when a word was mistranscribed.
+**Why I built this:** I got sick of poor transcription tools, and I was tired of manually dictating punctuation. Worse: watching words appear on-screen in real-time broke my train of thought, especially when a word was mistranscribed.
 
-I just wanted a tool where I could hit a button, "word vomit" my thoughts into a text field, and hit Enter—without worrying about whether it picked up what I was saying. This tool is designed to be completely invisible until it drops the finished, perfectly punctuated text into your clipboard.
+I just wanted a tool where I could hit a button, "word vomit" my thoughts into a text field, and hit Enter—without being distracted by the transcription process. This tool is designed to be completely invisible until it drops the finished, perfectly punctuated text.
+
+**_UPDATE_**
+Added feature: say 'prompt ai' followed by instructions and it will use Ollama (or other local LLM) to edit the text per your instructions.
+
+Potential use: _hit record_ "The movie is Wednesday, I mean Tuesday, actually... Thursday at noon... Prompt AI, can you make that clear about it being Thursday?" _hit stop_ -> outputs -> "The movie is Thursday at noon."
+
+**_UPDATE 2_**
+Added Feature: Android app - local open source version of wispr flow with a floating button to press to record and press to stop. Record as long as you want with no pressure to keep going before it cuts you off. Also works with the 'prompt ai' feature.
+
+<p align="center">
+  <img src="git_images/Screenshot_20260325_215809_Docs.jpg" width="250" />
+  <img src="git_images/Screenshot_20260325_220016_Docs.jpg" width="250" />
+  <img src="git_images/Screenshot_20260325_220046_WhisperRemote.jpg" width="250" />
+</p>
 
 Running the `small` Whisper model on CUDA (using ~0.6GB of VRAM) with a cheap $12 used Blue microphone off eBay, this thing is _dang near perfect_. It handles long pauses and auto-punctuation with near-zero issues. For how often I use it, it is worth every megabyte of VRAM.Easily start/stop the service from a system tray icon (bottom right corner by your clock)
 
 ## Features
 
 - **Local API**: Fast transcription using CTranslate2 and ONNX.
-- **Background Listener**: Use the backtick (`` ` ``) key to record audio and paste transcription directly into any app. (top left of keyboard, directly under the Esc key)
-- **Context Menu Integration**: Right-click any audio file in Windows Explorer to "Transcribe to Clipboard".
+- **Background Listener**: Use the backtick (`` ` ``) to start and stop recording. (top left of keyboard, directly under the Esc key)
+- **Context Menu Integration**: Right-click any audio and most video files in Windows Explorer to "Transcribe to Clipboard".
+- **Android App**: Local open source version of wispr flow with a floating button to press to record and press to stop. Record as long as you want with no pressure to keep going before it cuts you off. Also works with the 'prompt ai' feature.
+- **Windows Service**: The API runs as a background service that starts automatically when you log in and restarts itself if it crashes.
+- **Windows Tray Icon**: The API runs as a background service that starts automatically when you log in and restarts itself if it crashes.
 
 ---
 
@@ -18,8 +35,9 @@ Running the `small` Whisper model on CUDA (using ~0.6GB of VRAM) with a cheap $1
 
 ### 1. Prerequisites
 
-- Python 3.8+
-- NVIDIA GPU with CUDA (recommended) or a fast CPU.
+- **Python 3.8+**
+- **NVIDIA GPU** with CUDA (recommended) or a fast CPU.
+- **~1.5 GB Free Disk Space**: The first time you launch the application, it will automatically connect to HuggingFace to download the AI model weights. Depending on your internet speed, the very first launch may appear to hang for several minutes while it downloads.
 
 ### 2. Setup Environment
 
@@ -36,13 +54,23 @@ pip install -r requirements.txt
 
 ### 3. Configuration
 
-Copy the default configuration file and edit it to suit your hardware.
+**Environment Setup:**  
+Copy the default `.env.example` to `.env` to suit your hardware.
 
 ```powershell
 copy .env.example .env
 ```
 
 Open `.env` to configure your `WHISPER_MODEL_SIZE`, `WHISPER_DEVICE`, and background service settings.
+
+**Name Auto-Corrections & AI Triggers:**  
+The API automatically corrects specific names and catches "trigger words" to send to an external AI editing loop. To customize these rules:
+
+```powershell
+copy processing_config.example.json processing_config.json
+```
+
+Open `processing_config.json` to safely edit your own name corrections and AI trigger words.
 
 ---
 
@@ -108,3 +136,20 @@ _Note: Ensure you have run the Python setup steps above first, as this relies on
 - `install_context_menu.ps1`: Automated installer for the Explorer right-click integration.
 - `.env`: Configuration settings for the model, device, and service behaviors.
 - `.gitignore`: Configured to ignore virtual environments and common AI agent files (`agent.md`, `claude.md`, etc.).
+
+---
+
+## Troubleshooting
+
+### Accessing the API from Other Devices (Tailscale / LAN)
+
+If you installed the API using `install_service.ps1` to run in the background (Option 2), the Windows Service uses NSSM and is restricted to `localhost` (`127.0.0.1`) by default for security to prevent unwanted local access to your system.
+
+If you want to reach the API from your phone or another computer (like over Tailscale), you will get no response until you bind the service to your network interfaces.
+
+**The Fix:**
+
+1. Open `install_service.ps1` in a text editor (like VS Code or Notepad).
+2. Find the line that looks like: `... --host 127.0.0.1 --port 5000`
+3. Change `127.0.0.1` to `0.0.0.0`.
+4. Run `install_service.ps1` again as Administrator to apply the change to the background service. _(Ensure Windows Firewall allows TCP Port 5000)._

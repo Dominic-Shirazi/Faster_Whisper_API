@@ -50,7 +50,7 @@ if ($existingService) {
 
 # 4. Install Service with NSSM
 Write-Host "Installing $ServiceName via NSSM..."
-& $NSSM_EXE install $ServiceName $PythonPath "-m uvicorn whisper_api:app --host 127.0.0.1 --port 5000"
+& $NSSM_EXE install $ServiceName $PythonPath "-m uvicorn whisper_api:app --host 0.0.0.0 --port 5000"
 & $NSSM_EXE set $ServiceName AppDirectory $BaseDir
 & $NSSM_EXE set $ServiceName Description "Faster-Whisper local API"
 & $NSSM_EXE set $ServiceName Start SERVICE_AUTO_START

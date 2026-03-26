@@ -1,0 +1,13 @@
+{
+  "_comment_instructions": "This file contains settings for name corrections and AI trigger words. You can edit this file to suite your needs.",
+  "_comment_regex_help": "Trigger patterns use Regular Expressions (Regex). '\\s*' means zero or more spaces. '\\.?' means an optional period. For example, 'prompt\\s*a\\.?i\\.?' matches 'promptai', 'prompt a.i.', and 'prompt ai'.",
+  "name_corrections": {
+    "Leslie": "Lesley",
+    "Emma": "Ame"
+  },
+  "trigger_patterns": [
+    "prompt\\s*a\\.?i\\.?",
+    "promptai",
+    "end\\s*prompt"
+  ]
+}

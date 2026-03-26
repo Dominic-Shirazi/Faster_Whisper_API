@@ -58,6 +58,11 @@ def on_quit(icon, item):
     icon.stop()
     os._exit(0)
 
+def restart_api(icon, item):
+    print("[Watchdog] Requesting elevated restart of FasterWhisperAPI...")
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", "-WindowStyle Hidden -Command Restart-Service -Name FasterWhisperAPI -Force", None, 0)
+    icon.notify("Reloading Config and AI Model...", "API Restarting")
+
 def pause_api(icon, item):
     print("[Watchdog] Requesting elevated pause of FasterWhisperAPI...")
     # 0 = SW_HIDE (hides the cmd window, but UAC prompt still shows)
@@ -72,6 +77,7 @@ def resume_api(icon, item):
 def setup_tray():
     icon_image = create_tray_icon()
     menu = pystray.Menu(
+        pystray.MenuItem('Restart API (Apply Config Changes)', restart_api),
         pystray.MenuItem('Resume API (Load Model)', resume_api),
         pystray.MenuItem('Pause API (Free VRAM)', pause_api),
         pystray.Menu.SEPARATOR,
