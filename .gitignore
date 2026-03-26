@@ -61,3 +61,15 @@ Thumbs.db
 # Temp Files
 temp_recording.wav
 processing_config.json
+
+# Environment Variables
+.env
+
+# Audio / Media
+*.wav
+*.mp3
+*.m4a
+
+# Temp Bins
+nssm.exe
+nssm.zip
