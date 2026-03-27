@@ -12,6 +12,10 @@ Potential use: _hit record_ "The movie is Wednesday, I mean Tuesday, actually...
 **_UPDATE 2_**
 Added Feature: Android app - local open source version of wispr flow with a floating button to press to record and press to stop. Record as long as you want with no pressure to keep going before it cuts you off. Also works with the 'prompt ai' feature.
 
+**Android App Repo Here:** https://github.com/Dominic-Shirazi/WhisperRemote_for_Android
+
+**Apk in repo:** /ANDROID_APK_HERE/app-debug.apk
+
 <p align="center">
   <img src="readme_images/Screenshot_20260325_215809_Docs.jpg" width="250" />
   <img src="readme_images/Screenshot_20260325_220016_Docs.jpg" width="250" />
