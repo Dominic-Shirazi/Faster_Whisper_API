@@ -11,6 +11,12 @@ import tkinter as tk
 from tkinter import ttk
 import requests
 from dotenv import load_dotenv
+import json
+import sys
+
+# Add parent directory to sys.path so we can import our human_typing module
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from human_typing.human_typer import HumanTyper
 
 # Load env file in the child too
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
@@ -191,15 +197,39 @@ def transcribe_and_paste():
         print(f"[Listener] Transcribed: {text}")
         
         if text:
-            # Copy to clipboard
-            pyperclip.copy(text)
-            
-            # Paste
-            time.sleep(0.1)
-            keyboard.send('backspace, backspace')
-            time.sleep(0.1)
-            keyboard.send('ctrl+v')
-            print("[Listener] Pasted.")
+            # Read settings to determine typing mode
+            mode = "paste"
+            settings_path = os.path.join(os.path.dirname(__file__), "settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r') as f:
+                    try:
+                        mode = json.load(f).get("typing_mode", "paste")
+                    except json.JSONDecodeError:
+                        pass
+                        
+            if mode == "type":
+                print("[Listener] Human Typing mode...")
+                
+                # Always copy to clipboard as a backup
+                pyperclip.copy(text)
+
+                time.sleep(0.1)
+                keyboard.send('backspace, backspace')
+                time.sleep(0.1)
+                
+                typer = HumanTyper()
+                typer.type(text)
+                print("[Listener] Typed organically.")
+            else:
+                # Copy to clipboard
+                pyperclip.copy(text)
+                
+                # Paste
+                time.sleep(0.1)
+                keyboard.send('backspace, backspace')
+                time.sleep(0.1)
+                keyboard.send('ctrl+v')
+                print("[Listener] Pasted immediately.")
         else:
             if overlay:
                 overlay.update_label_safe("No speech detected.")

@@ -11,3 +11,4 @@ pywin32
 tk
 python-multipart
 python-dotenv
+PyYAML
