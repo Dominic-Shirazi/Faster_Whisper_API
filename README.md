@@ -12,6 +12,9 @@ Potential use: _hit record_ "The movie is Wednesday, I mean Tuesday, actually...
 **_UPDATE 2_**
 Added Feature: Android app - local open source version of wispr flow with a floating button to press to record and press to stop. Record as long as you want with no pressure to keep going before it cuts you off. Also works with the 'prompt ai' feature.
 
+**_UPDATE 3_**
+Added feature: say 'prompt ai roast' or 'prompt roast' to trigger a specialized condescending editor mode. It pulls dynamic insults from `insults.txt` in the root directory, injecting witty roasts into the transcribed text based on your instructions. You can easily add more insults to the text file over time.
+
 **Android App Repo Here:** https://github.com/Dominic-Shirazi/WhisperRemote_for_Android
 
 **Apk in repo:** /ANDROID_APK_HERE/app-debug.apk
@@ -28,6 +31,7 @@ Running the `small` Whisper model on CUDA (using ~0.6GB of VRAM) with a cheap $1
 
 - **Local API**: Fast transcription using CTranslate2 and ONNX.
 - **Background Listener**: Use the backtick (`` ` ``) to start and stop recording. (top left of keyboard, directly under the Esc key)
+- **Remote Desktop Paste**: Works inside Chrome Remote Desktop sessions. The listener forces the local clipboard to sync to the remote machine before pasting, so dictation drops into apps on the far end just like it does locally (see Troubleshooting).
 - **Context Menu Integration**: Right-click any audio and most video files in Windows Explorer to "Transcribe to Clipboard".
 - **Android App**: Local open source version of wispr flow with a floating button to press to record and press to stop. Record as long as you want with no pressure to keep going before it cuts you off. Also works with the 'prompt ai' feature.
 - **Windows Service**: The API runs as a background service that starts automatically when you log in and restarts itself if it crashes.
@@ -157,6 +161,24 @@ If you want to reach the API from your phone or another computer (like over Tail
 2. Find the line that looks like: `... --host 127.0.0.1 --port 5000`
 3. Change `127.0.0.1` to `0.0.0.0`.
 4. Run `install_service.ps1` again as Administrator to apply the change to the background service. _(Ensure Windows Firewall allows TCP Port 5000)._
+
+### Pasting into Chrome Remote Desktop (or other remote sessions)
+
+If you run the listener on your **local** machine but dictate into an app inside a **Chrome Remote Desktop** window, a plain clipboard paste used to fail — it would either paste nothing or paste the remote machine's _old_ clipboard.
+
+This is a Chrome Remote Desktop quirk, not a bug in this tool: CRD only pushes your local clipboard to the remote machine on a window **focus-in** event, and only for a "real" copy. A silent, programmatic clipboard write doesn't trigger the sync, so `Ctrl+V` pastes whatever stale text the remote already had.
+
+**The listener handles this automatically.** Before pasting it copies the text from a real (off-screen, invisible) window and briefly bounces window focus, which is exactly the event CRD needs to sync the clipboard across. You may notice a tiny screen flicker as focus leaves and returns — that flicker _is_ the sync happening.
+
+**If it still pastes stale text** (slow or laggy connections), give the sync more time. In your `.env`:
+
+```
+# Seconds to wait for the clipboard to reach the remote machine before pasting.
+# Raise this on slow connections (e.g. 1.0 or 1.5).
+CRD_SYNC_DELAY_SECONDS=0.6
+```
+
+> **Note:** "Human typing" mode (`typing_mode: "type"`) does **not** work over Chrome Remote Desktop — CRD drops the Unicode keystrokes it injects. Use the default paste mode for remote sessions.
 
 ---
 
