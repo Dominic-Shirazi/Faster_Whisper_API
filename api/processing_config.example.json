@@ -9,5 +9,10 @@
     "prompt\\s*a\\.?i\\.?",
     "promptai",
     "end\\s*prompt"
-  ]
+  ],
+  "roast_trigger_patterns": [
+    "prompt\\s*a\\.?i\\.?\\W*(?:to\\s*)?roast",
+    "prompt\\W*(?:to\\s*)?roast"
+  ],
+  "insults_file_path": "insults.txt"
 }
