@@ -11,6 +11,25 @@ import json
 process = None
 running = True
 
+
+def ensure_single_instance():
+    """Exit immediately if another watchdog is already running.
+
+    Without this, launching the watchdog twice (e.g. the login startup task AND
+    a manual LAUNCHER.bat, or relaunching before quitting the tray icon) spawns a
+    second watchdog -- and each watchdog spawns its own background_listener, so
+    you end up with duplicate hotkey listeners double-firing every transcription.
+
+    A Windows named mutex makes the second launch a no-op. The handle is kept for
+    the life of the process (Windows frees it automatically on exit).
+    """
+    ERROR_ALREADY_EXISTS = 183
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "FasterWhisperWatchdogSingleton")
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        # Another watchdog already owns the mutex; this instance is redundant.
+        os._exit(0)
+    return handle
+
 def create_tray_icon():
     # Draws a simple red circle (like a recording indicator) for the system tray
     width, height = 64, 64
@@ -124,6 +143,10 @@ def setup_tray():
     icon.run()
 
 if __name__ == "__main__":
+    # Bail out if a watchdog is already running, so we never end up with
+    # duplicate listeners double-firing every transcription.
+    _singleton_handle = ensure_single_instance()
+
     # If the user double clicked the watchdog and it opened a console window by mistake (e.g., using python.exe)
     # the creationflags=subprocess.CREATE_NO_WINDOW in Popen will still ensure the child is invisible.
     setup_tray()
