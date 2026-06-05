@@ -7,6 +7,8 @@ import threading
 import time
 import os
 import pyperclip
+import ctypes
+from ctypes import wintypes
 import tkinter as tk
 from tkinter import ttk
 import requests
@@ -28,6 +30,122 @@ MAX_DURATION_MINS = 10
 LISTENER_RESTART_INTERVAL_MINS = int(os.environ.get("LISTENER_RESTART_INTERVAL_MINS", 10))
 WAV_OUTPUT_PATH = os.path.join(os.path.dirname(__file__), 'temp_recording.wav')
 API_URL = "http://127.0.0.1:5000/transcribe"
+
+# How long to let Chrome Remote Desktop push the local clipboard to the remote
+# host after we nudge its window focus, before we send Ctrl+V. Tune via .env if
+# your connection is slow.
+CRD_SYNC_DELAY = float(os.environ.get("CRD_SYNC_DELAY_SECONDS", 0.6))
+
+# --- Win32 plumbing for Chrome Remote Desktop clipboard sync -----------------
+# CRD pushes the LOCAL clipboard to the REMOTE machine on a window focus-IN
+# event, and only when the clipboard was written by a real, focused window doing
+# a real copy (like Notepad) -- not by a headless API write (pyperclip) from a
+# hidden owner window that's destroyed instantly.
+#
+# So we reproduce the manual "copy in Notepad, then click into CRD" workaround:
+#   1. spawn a real (off-screen) EDIT control,
+#   2. give it foreground focus, fill it, select all, issue a real copy,
+#   3. destroy it -> focus falls back to the CRD window. THAT focus-in is what
+#      makes CRD sync the fresh clipboard to the remote machine.
+#   4. then paste.
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+
+_WS_POPUP = 0x80000000
+_WS_VISIBLE = 0x10000000
+_ES_MULTILINE = 0x0004
+_ES_AUTOVSCROLL = 0x0040
+_WS_EX_TOOLWINDOW = 0x00000080
+_EM_SETSEL = 0x00B1
+_WM_COPY = 0x0301
+
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.FindWindowW.restype = wintypes.HWND
+_user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.BringWindowToTop.argtypes = [wintypes.HWND]
+_user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+_user32.DestroyWindow.argtypes = [wintypes.HWND]
+_user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_user32.CreateWindowExW.restype = wintypes.HWND
+_user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+]
+_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
+
+def _set_foreground(hwnd):
+    """Force `hwnd` to the foreground as reliably as Windows allows.
+
+    AttachThreadInput defeats the cross-process foreground lock so the switch
+    (Chrome <-> our window) actually happens. Returns True if `hwnd` ended up as
+    the foreground window. Best-effort: failures are logged and swallowed.
+    """
+    if not hwnd:
+        return False
+    try:
+        fg = _user32.GetForegroundWindow()
+        fg_thread = _user32.GetWindowThreadProcessId(fg, None)
+        cur_thread = _kernel32.GetCurrentThreadId()
+        attached = fg_thread and fg_thread != cur_thread
+        if attached:
+            _user32.AttachThreadInput(cur_thread, fg_thread, True)
+        try:
+            _user32.BringWindowToTop(hwnd)
+            _user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                _user32.AttachThreadInput(cur_thread, fg_thread, False)
+        time.sleep(0.03)
+        return _user32.GetForegroundWindow() == hwnd
+    except Exception as e:
+        print(f"[Listener] set_foreground failed (continuing): {e}")
+        return False
+
+
+def copy_via_real_window(text, target_hwnd):
+    """Copy `text` to the clipboard from a real focused EDIT control, the way an
+    app like Notepad does, then hand focus back to `target_hwnd`.
+
+    The spawned window is real (off-screen so it never flashes), takes foreground,
+    does a genuine WM_COPY (exactly what Ctrl+C triggers inside an edit control),
+    then is destroyed so focus returns to the target -- generating the focus-in
+    that Chrome Remote Desktop needs to sync the clipboard. Returns True on success.
+    """
+    edit_hwnd = None
+    left_target = False
+    try:
+        hinst = _kernel32.GetModuleHandleW(None)
+        style = _WS_POPUP | _WS_VISIBLE | _ES_MULTILINE | _ES_AUTOVSCROLL
+        # Spawned far off-screen so the user never sees it.
+        edit_hwnd = _user32.CreateWindowExW(
+            _WS_EX_TOOLWINDOW, "EDIT", None, style,
+            -32000, -32000, 10, 10, None, None, hinst, None,
+        )
+        if not edit_hwnd:
+            return False
+
+        _user32.SetWindowTextW(edit_hwnd, text)
+        left_target = _set_foreground(edit_hwnd)   # real window takes focus (Chrome loses it)
+        time.sleep(0.15)                            # let Chrome register the deactivation
+        _user32.SendMessageW(edit_hwnd, _EM_SETSEL, 0, -1)   # select all
+        _user32.SendMessageW(edit_hwnd, _WM_COPY, 0, 0)      # real edit-control copy
+        time.sleep(0.05)
+        return True
+    except Exception as e:
+        print(f"[Listener] real-window copy failed: {e}")
+        return False
+    finally:
+        if edit_hwnd:
+            _user32.DestroyWindow(edit_hwnd)        # close popup -> focus returns
+        back = _set_foreground(target_hwnd)         # ...to the CRD window (focus-in)
+        # Diagnostic: did the OS-level foreground bounce actually happen?
+        # Both must be True for Chrome Remote Desktop to re-sync the clipboard.
+        print(f"[Listener] focus bounce  left_target={left_target}  back_to_target={back}")
 
 # Global State
 recording_active = False
@@ -221,15 +339,28 @@ def transcribe_and_paste():
                 typer.type(text)
                 print("[Listener] Typed organically.")
             else:
-                # Copy to clipboard
-                pyperclip.copy(text)
-                
-                # Paste
+                # Remember the window we're typing into, before we touch focus.
+                target_hwnd = _user32.GetForegroundWindow()
+
+                # Remove the two backtick characters the hotkey left behind,
+                # while the target window still has focus.
                 time.sleep(0.1)
                 keyboard.send('backspace, backspace')
                 time.sleep(0.1)
+
+                # Copy from a real off-screen window and bounce focus back to the
+                # target, so Chrome Remote Desktop sees a real copy + focus-in and
+                # syncs the clipboard to the remote machine. Falls back to a plain
+                # clipboard write if the real-window copy fails.
+                if not copy_via_real_window(text, target_hwnd):
+                    pyperclip.copy(text)
+                    _set_foreground(target_hwnd)
+
+                # Give CRD time to push the clipboard across before we paste.
+                time.sleep(CRD_SYNC_DELAY)
+
                 keyboard.send('ctrl+v')
-                print("[Listener] Pasted immediately.")
+                print("[Listener] Pasted.")
         else:
             if overlay:
                 overlay.update_label_safe("No speech detected.")
