@@ -13,7 +13,9 @@ Potential use: _hit record_ "The movie is Wednesday, I mean Tuesday, actually...
 Added Feature: Android app - local open source version of wispr flow with a floating button to press to record and press to stop. Record as long as you want with no pressure to keep going before it cuts you off. Also works with the 'prompt ai' feature.
 
 **_UPDATE 3_**
-Added feature: say 'prompt ai roast' or 'prompt roast' to trigger a specialized condescending editor mode. It pulls dynamic insults from `insults.txt` in the root directory, injecting witty roasts into the transcribed text based on your instructions. You can easily add more insults to the text file over time.
+Added feature: say 'prompt ai roast' / 'prompt roast', 'prompt tiktok' (also recognized as 'tick tock'), or 'prompt disses' to trigger a shared **mean mode** editor. It takes your dictated brain-dump, works out the reasoning flaw the other person is making, reorganizes your thoughts into a tight social-media-ready reply in your own voice (plain text, no em-dashes), and weaves in a matching witty insult. Insults live in `insults.md` in the root directory, grouped by the kind of reasoning failure they target so the AI can pick one that actually fits, you can add your own under any heading over time.
+
+Mean mode runs on a local uncensored model so it won't refuse. Pull it once before first use: `ollama pull huihui_ai/qwen2.5-abliterate:7b` (or set `OLLAMA_ROAST_MODEL` in `.env` to whatever uncensored model you prefer). Because triggers are detected server-side, this works from the Android app and any other client with no changes.
 
 **Android App Repo Here:** https://github.com/Dominic-Shirazi/WhisperRemote_for_Android
 

@@ -1,6 +1,7 @@
 {
   "_comment_instructions": "This file contains settings for name corrections and AI trigger words. You can edit this file to suite your needs.",
   "_comment_regex_help": "Trigger patterns use Regular Expressions (Regex). '\\s*' means zero or more spaces. '\\.?' means an optional period. For example, 'prompt\\s*a\\.?i\\.?' matches 'promptai', 'prompt a.i.', and 'prompt ai'.",
+  "_comment_roast_mode": "roast_trigger_patterns is the shared 'mean mode'. 'prompt roast', 'prompt tiktok' (also transcribed as 'tick tock'), and 'prompt disses' all route to the same social-media-tuned rewriter that weaves in a matching line from insults_file_path. It is checked BEFORE the normal trigger_patterns.",
   "name_corrections": {
     "Leslie": "Lesley",
     "Emma": "Ame"
@@ -12,7 +13,11 @@
   ],
   "roast_trigger_patterns": [
     "prompt\\s*a\\.?i\\.?\\W*(?:to\\s*)?roast",
-    "prompt\\W*(?:to\\s*)?roast"
+    "prompt\\W*(?:to\\s*)?roast",
+    "prompt\\s*a\\.?i\\.?\\W*(?:tik\\s*tok|tick\\s*tock)",
+    "prompt\\W*(?:tik\\s*tok|tick\\s*tock)",
+    "prompt\\s*a\\.?i\\.?\\W*(?:some\\s*)?diss(?:es)?",
+    "prompt\\W*(?:some\\s*)?diss(?:es)?"
   ],
-  "insults_file_path": "insults.txt"
+  "insults_file_path": "insults.md"
 }

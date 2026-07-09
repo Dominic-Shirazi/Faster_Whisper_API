@@ -15,9 +15,13 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 # Configuration
 MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small.en")
 DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+# Mean-mode (roast/tiktok/disses) runs on this box against the local Ollama.
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generate")
+# Base 'prompt ai' editing can run on a separate machine (e.g. AI_worker2).
+# Falls back to the local Ollama if OLLAMA_EDIT_API_URL is not set.
+OLLAMA_EDIT_API_URL = os.getenv("OLLAMA_EDIT_API_URL", OLLAMA_API_URL)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M")
-OLLAMA_ROAST_MODEL = os.getenv("OLLAMA_ROAST_MODEL", "llama2-uncensored:latest")
+OLLAMA_ROAST_MODEL = os.getenv("OLLAMA_ROAST_MODEL", "chatgpt1/qwythos-9b-claude-mythos-5-1m-abliterated:latest")
 COMPUTE_TYPE = "float16"
 TEMP_DIR = os.path.dirname(__file__)
 
@@ -43,8 +47,12 @@ def load_config():
         "roast_trigger_patterns": [
             "prompt\\s*a\\.?i\\.?\\W*(?:to\\s*)?roast",
             "prompt\\W*(?:to\\s*)?roast",
+            "prompt\\s*a\\.?i\\.?\\W*(?:tik\\s*tok|tick\\s*tock)",
+            "prompt\\W*(?:tik\\s*tok|tick\\s*tock)",
+            "prompt\\s*a\\.?i\\.?\\W*(?:some\\s*)?diss(?:es)?",
+            "prompt\\W*(?:some\\s*)?diss(?:es)?",
         ],
-        "insults_file_path": "insults.txt",
+        "insults_file_path": "insults.md",
     }
 
     for path in [config_path, example_path]:
@@ -61,6 +69,43 @@ def load_config():
 
 
 CONFIG = load_config()
+
+
+def strip_think(text: str) -> str:
+    # Reasoning models (e.g. qwythos) emit a <think>...</think> block; the real
+    # reply is whatever follows the last </think>. Sometimes only the closing tag
+    # is present. Keep just the final answer so we never paste the reasoning.
+    if "</think>" in text:
+        return text.rsplit("</think>", 1)[1].strip()
+    if "<think>" in text:
+        return text.split("<think>", 1)[0].strip()
+    return text
+
+
+def sanitize_social_output(text: str) -> str:
+    # Mean-mode output should be paste-ready for a social reply. The model
+    # ignores the formatting rules often, so enforce them deterministically.
+    # 1. No em/en dashes -> comma (then collapse any doubled commas that makes).
+    text = re.sub(r"\s*[—–]\s*", ", ", text)
+    text = re.sub(r",\s*,", ",", text)
+    # 2. Strip hashtags and emoji. Voice dictation never produces these, so any
+    #    in the output were invented by the model against the "no hashtags/emoji"
+    #    rule. Covers emoji planes, misc symbols/dingbats, flags, arrows, plus
+    #    the joiner/variation-selector glue that would otherwise be orphaned.
+    text = re.sub(r"#[\w-]+", "", text)
+    text = re.sub(
+        "[\U0001F000-\U0001FAFF"  # emoji planes (symbols, faces, etc.)
+        "\U00002600-\U000027BF"   # misc symbols + dingbats
+        "\U0001F1E6-\U0001F1FF"   # regional-indicator flag letters
+        "\U00002190-\U000021FF"   # arrows
+        "\U00002B00-\U00002BFF"   # misc symbols and arrows
+        "\U0000FE0F\U0000200D]",   # variation selector + zero-width joiner
+        "",
+        text,
+    )
+    # 3. Tidy whitespace left behind by the removals.
+    text = re.sub(r"[ \t]{2,}", " ", text).strip()
+    return text
 
 
 def read_insults(filepath: str) -> str:
@@ -87,9 +132,43 @@ def process_transcribed_text(text: str) -> str:
     if roast_list:
         roast_pattern = r"\b(" + "|".join(roast_list) + r")\b"
         if re.search(roast_pattern, text, flags=re.IGNORECASE):
-            print("[API] Roast Trigger word found, processing via Ollama...")
-            insults = read_insults(CONFIG.get("insults_file_path", "insults.txt"))
-            system_prompt = f"You are a writing assistant for a condescending and witty person and your goal is to make their writing as condescending and witty as possible. Please help roast this person. Rewrite the prompt to be as condescending as possible and for better flow, insert supplied insults throughout the roast (at LEAST one per request, more for longer requests, where it makes sense). You can either use the provided insults or make up similar ones to be inserted into the text output ('Insults so smart they take a few minutes to realize you were insulted'). Make sure they flow well (modify the text or insult to fit better if it makes sense). Do not speak directly to the user, You are writing as the user. Example: Prompt: 'The bible isn't real, if it was we'd expect talking snakes and burning bushes to talk too' Response: 'The bible isn't real. If it was we'd expect snakes and burning bushes to talk, ok?...Look, I could explain it to you further... But I left my crayons at home.' (you can add and/or alter the text or insults, but ensure the original message is still conveyed.) \n\n provided Insults:\n{insults}"
+            print("[API] Roast/TikTok Trigger word found, processing via Ollama...")
+            insults = read_insults(CONFIG.get("insults_file_path", "insults.md"))
+            system_prompt = (
+                "You are the ghostwriter for a witty, condescending person who is "
+                "firing back at someone online (often a reply to a TikTok comment or "
+                "a social media post). You are given their unstructured, dictated "
+                "brain-dump. Turn it into the reply they would actually post.\n\n"
+                "Do this:\n"
+                "1. Figure out the reasoning failure the OTHER person is making (are "
+                "they confidently wrong, ignoring evidence, faking expertise, just "
+                "slow, closed-minded?). The user's brain-dump tells you what the "
+                "other person got wrong; that flaw is your target.\n"
+                "2. Reorganize the user's scattered thoughts into a tight, clear, "
+                "succinct reply. Keep every point they actually made; cut the "
+                "rambling and filler.\n"
+                "3. Mirror the USER'S own voice and speech pattern from the "
+                "brain-dump (their slang, rhythm, and casualness). You are writing "
+                "AS the user, not to them. Do not sound like an AI.\n"
+                "4. Weave in at least one insult from the category below that "
+                "matches the other person's specific reasoning failure (more for a "
+                "longer reply, where it fits). You may reword one or invent a "
+                "similar one in the same spirit so it flows naturally. Each should "
+                "feel earned, not bolted on.\n\n"
+                "Hard formatting rules:\n"
+                "- Plain text only. No markdown, no bullet points, no headings.\n"
+                "- NEVER use em-dashes (—). Use commas, periods, or ellipses.\n"
+                "- No hashtags and no emoji unless the user used them first.\n"
+                "- Keep it short enough for a social media reply.\n"
+                "- Output ONLY the finished reply. No preamble, no quotes around it, "
+                "no explanation of what you did.\n\n"
+                "Example brain-dump: 'the bible isn't real, if it was we'd expect "
+                "talking snakes and burning bushes to talk too'\n"
+                "Example reply: 'The bible isn't real. If it was, we'd expect the "
+                "talking snakes and burning bushes to still be talking, right? Look, "
+                "I could explain it further, but I left my crayons at home.'\n\n"
+                f"Insults, grouped by the reasoning failure they target:\n{insults}"
+            )
             try:
                 response = requests.post(
                     OLLAMA_API_URL,
@@ -99,11 +178,12 @@ def process_transcribed_text(text: str) -> str:
                         "system": system_prompt,
                         "stream": False,
                     },
-                    timeout=60,
+                    timeout=120,
                 )
                 response.raise_for_status()
                 data = response.json()
-                return data.get("response", text).strip()
+                reply = strip_think(data.get("response", text).strip())
+                return sanitize_social_output(reply)
             except Exception as e:
                 print(f"[API] Ollama Roast Fast-Path error: {e}")
                 return text
@@ -113,10 +193,10 @@ def process_transcribed_text(text: str) -> str:
     if trigger_list:
         trigger_pattern = r"\b(" + "|".join(trigger_list) + r")\b"
         if re.search(trigger_pattern, text, flags=re.IGNORECASE):
-            print(f"[API] Trigger word found, processing via Ollama ({OLLAMA_MODEL})...")
+            print(f"[API] Trigger word found, processing via Ollama ({OLLAMA_MODEL} @ {OLLAMA_EDIT_API_URL})...")
             try:
                 response = requests.post(
-                    OLLAMA_API_URL,
+                    OLLAMA_EDIT_API_URL,
                     json={
                         "model": OLLAMA_MODEL,
                         "prompt": text,
