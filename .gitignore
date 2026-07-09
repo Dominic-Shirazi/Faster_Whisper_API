@@ -73,3 +73,6 @@ processing_config.json
 # Temp Bins
 nssm.exe
 nssm.zip
+
+# Fast-path diagnostic log (runtime)
+api/fastpath.log

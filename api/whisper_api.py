@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 import re
 import requests
 import json
+import time
+import traceback
 
 # Load configuration from .env file
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
@@ -43,7 +45,12 @@ def load_config():
 
     config = {
         "name_corrections": {"Leslie": "Lesley", "Emma": "Ame"},
-        "trigger_patterns": ["prompt\\s*a\\.?i\\.?", "promptai", "end\\s*prompt"],
+        "trigger_patterns": [
+            "prompt[\\s.,]*a\\.?\\s*i\\.?",
+            "promptai",
+            "prompte[\\s.,]*i\\.?",
+            "end\\s*prompt",
+        ],
         "roast_trigger_patterns": [
             "prompt\\s*a\\.?i\\.?\\W*(?:to\\s*)?roast",
             "prompt\\W*(?:to\\s*)?roast",
@@ -69,6 +76,16 @@ def load_config():
 
 
 CONFIG = load_config()
+
+
+def _fastlog(msg: str) -> None:
+    # NSSM does not capture stdout, so write fast-path diagnostics to a file we
+    # can actually read when a trigger fires but editing/roasting misbehaves.
+    try:
+        with open(os.path.join(TEMP_DIR, "fastpath.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
 
 
 def strip_think(text: str) -> str:
@@ -185,6 +202,7 @@ def process_transcribed_text(text: str) -> str:
                 reply = strip_think(data.get("response", text).strip())
                 return sanitize_social_output(reply)
             except Exception as e:
+                _fastlog(f"ROAST FAIL @ {OLLAMA_API_URL}: {e!r}\n{traceback.format_exc()}")
                 print(f"[API] Ollama Roast Fast-Path error: {e}")
                 return text
 
@@ -194,6 +212,7 @@ def process_transcribed_text(text: str) -> str:
         trigger_pattern = r"\b(" + "|".join(trigger_list) + r")\b"
         if re.search(trigger_pattern, text, flags=re.IGNORECASE):
             print(f"[API] Trigger word found, processing via Ollama ({OLLAMA_MODEL} @ {OLLAMA_EDIT_API_URL})...")
+            _fastlog(f"EDIT trigger fired -> POST {OLLAMA_EDIT_API_URL} model={OLLAMA_MODEL} | text={text!r}")
             try:
                 response = requests.post(
                     OLLAMA_EDIT_API_URL,
@@ -207,8 +226,11 @@ def process_transcribed_text(text: str) -> str:
                 )
                 response.raise_for_status()
                 data = response.json()
-                return data.get("response", text).strip()
+                edited = data.get("response", text).strip()
+                _fastlog(f"EDIT ok <- {len(edited)} chars")
+                return edited
             except Exception as e:
+                _fastlog(f"EDIT FAIL @ {OLLAMA_EDIT_API_URL}: {e!r}\n{traceback.format_exc()}")
                 print(f"[API] Ollama Fast-Path error: {e}")
                 return text
 

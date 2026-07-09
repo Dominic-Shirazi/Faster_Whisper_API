@@ -7,8 +7,9 @@
     "Emma": "Ame"
   },
   "trigger_patterns": [
-    "prompt\\s*a\\.?i\\.?",
+    "prompt[\\s.,]*a\\.?\\s*i\\.?",
     "promptai",
+    "prompte[\\s.,]*i\\.?",
     "end\\s*prompt"
   ],
   "roast_trigger_patterns": [
