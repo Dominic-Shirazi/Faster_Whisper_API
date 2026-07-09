@@ -26,6 +26,30 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M")
 OLLAMA_ROAST_MODEL = os.getenv("OLLAMA_ROAST_MODEL", "chatgpt1/qwythos-9b-claude-mythos-5-1m-abliterated:latest")
 COMPUTE_TYPE = "float16"
 TEMP_DIR = os.path.dirname(__file__)
+API_PORT = 5000
+
+
+def _port_already_serving(host: str = "127.0.0.1", port: int = API_PORT) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+# Single-instance guard for direct launches (python api/whisper_api.py,
+# LAUNCHER.bat). If something already serves the port, this is a duplicate:
+# refuse to start so we never squat the port with a second, possibly stale,
+# instance -- the exact failure that let an old manual run shadow the service.
+# The NSSM service starts via `uvicorn api.whisper_api:app`, so __name__ is not
+# "__main__" there and this guard is skipped (uvicorn owns the bind). Runs before
+# the model load so a duplicate exits instantly without touching the GPU.
+if __name__ == "__main__" and _port_already_serving():
+    print(
+        f"[API] Port {API_PORT} is already serving; another instance (likely the "
+        "FasterWhisperAPI service) is running. Not starting a duplicate."
+    )
+    raise SystemExit(1)
 
 app = FastAPI(title="Faster Whisper API")
 
@@ -319,4 +343,4 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT)
