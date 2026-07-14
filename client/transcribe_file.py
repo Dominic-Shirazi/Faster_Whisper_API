@@ -5,8 +5,12 @@ import tkinter as tk
 import os
 import threading
 import time
+from dotenv import load_dotenv
 
-API_URL = "http://127.0.0.1:5000/transcribe"
+# Load .env from the repo root so WHISPER_API_URL (and friends) are picked up
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+
+API_URL = os.environ.get("WHISPER_API_URL", "http://127.0.0.1:5000/transcribe")
 
 def show_toast(message, duration=2000):
     root = tk.Tk()

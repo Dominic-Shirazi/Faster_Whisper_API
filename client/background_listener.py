@@ -29,7 +29,7 @@ CHANNELS = 1
 MAX_DURATION_MINS = 10
 LISTENER_RESTART_INTERVAL_MINS = int(os.environ.get("LISTENER_RESTART_INTERVAL_MINS", 10))
 WAV_OUTPUT_PATH = os.path.join(os.path.dirname(__file__), 'temp_recording.wav')
-API_URL = "http://127.0.0.1:5000/transcribe"
+API_URL = os.environ.get("WHISPER_API_URL", "http://127.0.0.1:5000/transcribe")
 
 # How long to let Chrome Remote Desktop push the local clipboard to the remote
 # host after we nudge its window focus, before we send Ctrl+V. Tune via .env if
@@ -382,9 +382,11 @@ def toggle_recording():
         start_recording()
 
 if __name__ == "__main__":
-    # Startup sound (Rising tone)
-    winsound.Beep(500, 100)
-    winsound.Beep(800, 100)
+    # Startup sound (Rising tone) — only on the first launch. The watchdog sets
+    # WF_STARTUP_BEEP=0 on its periodic restarts so those stay silent.
+    if os.environ.get("WF_STARTUP_BEEP", "1") == "1":
+        winsound.Beep(500, 100)
+        winsound.Beep(800, 100)
 
     # Initialize overlay
     overlay = LoadingOverlay()

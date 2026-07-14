@@ -50,15 +50,20 @@ def run_subprocess():
         if os.path.exists(pythonw_path):
             python_exe = pythonw_path
             
+    first_launch = True
     while running:
         print("[Watchdog] Starting child listener process...")
+        # Only the very first launch plays the startup beep; periodic restarts stay silent.
+        child_env = os.environ.copy()
+        child_env["WF_STARTUP_BEEP"] = "1" if first_launch else "0"
         try:
             # We don't pipe stdout because pythonw suppresses it anyway, and we don't strictly need it
-            process = subprocess.Popen([python_exe, script_path], creationflags=subprocess.CREATE_NO_WINDOW)
+            process = subprocess.Popen([python_exe, script_path], creationflags=subprocess.CREATE_NO_WINDOW, env=child_env)
             process.wait()
         except Exception as e:
             print(f"[Watchdog] Error running listener: {e}")
-            
+
+        first_launch = False
         if running:
             # If the process exited gracefully (idle timeout) or crashed, give it a tiny breath, then restart it.
             time.sleep(1)
