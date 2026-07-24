@@ -76,3 +76,8 @@ nssm.zip
 
 # Fast-path diagnostic log (runtime)
 api/fastpath.log
+# Transcript corpus (runtime) -- contains the user's actual dictated speech, private
+api/transcripts.log
+.gstack/
+# Agent working scratch (research artifacts, agy done-markers)
+.agentfiles/

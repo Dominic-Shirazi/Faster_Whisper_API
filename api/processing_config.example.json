@@ -1,15 +1,14 @@
 {
   "_comment_instructions": "This file contains settings for name corrections and AI trigger words. You can edit this file to suite your needs.",
-  "_comment_regex_help": "Trigger patterns use Regular Expressions (Regex). '\\s*' means zero or more spaces. '\\.?' means an optional period. For example, 'prompt\\s*a\\.?i\\.?' matches 'promptai', 'prompt a.i.', and 'prompt ai'.",
+  "_comment_regex_help": "Trigger patterns use Regular Expressions (Regex), matched case-insensitively. '[^a-zA-Z]{0,2}' means up to two non-letter characters (spaces, dots, hyphens, commas). '(?:eye|i)' matches the letter 'i' or the phonetic spelling 'eye'. So 'prompt[^a-zA-Z]{0,2}a[^a-zA-Z]{0,2}(?:eye|i)' matches 'promptai', 'prompt ai', 'prompt a.i.', 'prompt A-I', 'prompt a eye', and 'prompt A. Eye'. Raise the '2' to allow more spacing.",
   "_comment_roast_mode": "roast_trigger_patterns is the shared 'mean mode'. 'prompt roast', 'prompt tiktok' (also transcribed as 'tick tock'), and 'prompt disses' all route to the same social-media-tuned rewriter that weaves in a matching line from insults_file_path. It is checked BEFORE the normal trigger_patterns.",
   "name_corrections": {
     "Leslie": "Lesley",
     "Emma": "Ame"
   },
   "trigger_patterns": [
-    "prompt[\\s.,]*a\\.?\\s*i\\.?",
-    "promptai",
-    "prompte[\\s.,]*i\\.?",
+    "prompt[^a-zA-Z]{0,2}a[^a-zA-Z]{0,2}(?:eye|i)",
+    "prompte[\\s.,\\-]*i\\.?",
     "end\\s*prompt"
   ],
   "roast_trigger_patterns": [
