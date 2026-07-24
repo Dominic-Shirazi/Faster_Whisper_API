@@ -27,6 +27,12 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 SAMPLE_RATE = 44100
 CHANNELS = 1
 MAX_DURATION_MINS = 10
+# Recordings shorter than this are treated as accidental taps / near-silent
+# blips and dropped before they ever hit the API. Whisper's decoder falls back
+# to its language prior on silence and hallucinates end-of-clip filler (usually
+# "Thank you."), so a fast double-tap of the hotkey would otherwise paste a
+# phantom "thank you". Tune via .env if legitimate one-word utterances get cut.
+MIN_RECORDING_DURATION_SEC = float(os.environ.get("MIN_RECORDING_DURATION_SEC", 0.4))
 LISTENER_RESTART_INTERVAL_MINS = int(os.environ.get("LISTENER_RESTART_INTERVAL_MINS", 10))
 WAV_OUTPUT_PATH = os.path.join(os.path.dirname(__file__), 'temp_recording.wav')
 API_URL = os.environ.get("WHISPER_API_URL", "http://127.0.0.1:5000/transcribe")
@@ -193,6 +199,11 @@ class LoadingOverlay:
         self.root.geometry(f'+{x}+{y}')
 
     def show(self):
+        # Reset the label every time we show, so a previous run's error message
+        # ("No speech detected.", a long API error) never sticks around on the
+        # next recording. Without this the label keeps the last text it was set
+        # to, since successful runs never touch it.
+        self.label.config(text="Transcribing...")
         self.root.deiconify()
         self.progress.start(10)
         self.center_window()
@@ -280,21 +291,29 @@ def idle_monitor():
 
 def save_and_transcribe():
     global recording_data
-    
+
+    if not recording_data:
+        print("[Listener] No data recorded.")
+        return
+
+    # Drop accidental taps / near-silent blips before showing the overlay or
+    # touching the API. Measured from the actual captured samples, not wall
+    # clock, so it reflects real audio length. See MIN_RECORDING_DURATION_SEC.
+    audio = np.concatenate(recording_data, axis=0)
+    duration_sec = len(audio) / SAMPLE_RATE
+    if duration_sec < MIN_RECORDING_DURATION_SEC:
+        print(f"[Listener] Recording too short ({duration_sec:.2f}s < {MIN_RECORDING_DURATION_SEC}s). Skipping.")
+        return
+
     # Show overlay
     if overlay:
         overlay.show_safe()
 
     try:
-        if not recording_data:
-            print("[Listener] No data recorded.")
-            return
-
         print("[Listener] Saving WAV...")
-        audio = np.concatenate(recording_data, axis=0)
         os.makedirs(os.path.dirname(WAV_OUTPUT_PATH), exist_ok=True)
         wav.write(WAV_OUTPUT_PATH, SAMPLE_RATE, np.int16(audio * 32767))
-        
+
         transcribe_and_paste()
     finally:
         # Hide overlay

@@ -68,17 +68,53 @@ def run_subprocess():
             # If the process exited gracefully (idle timeout) or crashed, give it a tiny breath, then restart it.
             time.sleep(1)
 
-def on_quit(icon, item):
-    global running, process
-    print("[Watchdog] Quitting via system tray...")
-    running = False
-    
-    if process:
+def _kill_listener_tree():
+    """Kill the child listener process AND any grandchild it spawned.
+
+    Popen hands us the venv's pythonw stub, which launches the real interpreter as
+    its own child. Terminating only the stub can leave that grandchild alive -- it
+    would keep the backtick hotkey registered, and once the watchdog spawns a
+    replacement you'd have two listeners double-firing every transcription.
+    taskkill /T kills the whole tree, so a restart or quit is always clean.
+    """
+    global process
+    if not process:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            capture_output=True,
+        )
+    except Exception as e:
+        print(f"[Watchdog] taskkill failed ({e}); falling back to terminate()")
         try:
             process.terminate()
         except Exception:
             pass
-            
+
+
+def restart_listener(icon, item):
+    """Restart just the listener child, leaving the tray icon and API untouched.
+
+    The hotkey can stop responding while the listener process is still alive --
+    Windows silently drops a low-level keyboard hook if the process is busy too
+    long, or after a UAC prompt. The watchdog only respawns on process EXIT, so it
+    can't detect a dead hook. Killing the child here makes run_subprocess()'s
+    process.wait() return and the loop starts a fresh listener within ~1 second.
+    """
+    print("[Watchdog] Restarting listener child on request...")
+    _kill_listener_tree()
+    icon.notify("Listener restarting, backtick should work in a moment.", "Listener Restarted")
+
+
+def on_quit(icon, item):
+    global running, process
+    print("[Watchdog] Quitting via system tray...")
+    running = False
+
+    _kill_listener_tree()
+
     icon.stop()
     os._exit(0)
 
@@ -131,6 +167,10 @@ def setup_tray():
     icon_image = create_tray_icon()
     menu = pystray.Menu(
         pystray.MenuItem(get_typing_mode_text, toggle_typing_mode),
+        pystray.Menu.SEPARATOR,
+        # No elevation needed and it's the usual fix when backtick goes dead,
+        # so it sits above the API actions (which all trigger a UAC prompt).
+        pystray.MenuItem('Restart Listener (fix dead hotkey)', restart_listener),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem('Restart API (Apply Config Changes)', restart_api),
         pystray.MenuItem('Resume API (Load Model)', resume_api),
