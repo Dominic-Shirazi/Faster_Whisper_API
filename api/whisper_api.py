@@ -219,12 +219,42 @@ def _segment_is_reliable(seg) -> bool:
     return True
 
 
-def _log_transcript(raw_text: str, final_text: str, info, dropped: list) -> None:
+def _confidence_summary(segments: list) -> dict:
+    """Collapse a list of segments into one comparable confidence score.
+
+    faster-whisper reports avg_logprob per segment (higher = more confident,
+    typically ~-0.15 on clean near-field speech, dipping past ~-0.7 as noise
+    degrades the decode). We weight by segment duration so a long clip and a
+    short one compare fairly, and also surface the single worst segment and the
+    mean no-speech probability. This is the score the adaptive dual-pass will
+    compare between the raw and denoised passes; logging it now, before that
+    feature exists, is how we discover where the quiet-room vs. noisy cutoff
+    actually falls on real speech instead of guessing.
+    """
+    if not segments:
+        return {"wlogp": 0.0, "minlogp": 0.0, "mean_nsp": 0.0, "n": 0}
+    total_dur = 0.0
+    weighted = 0.0
+    for s in segments:
+        dur = max(s.end - s.start, 1e-3)
+        weighted += s.avg_logprob * dur
+        total_dur += dur
+    return {
+        "wlogp": weighted / total_dur if total_dur else 0.0,
+        "minlogp": min(s.avg_logprob for s in segments),
+        "mean_nsp": sum(s.no_speech_prob for s in segments) / len(segments),
+        "n": len(segments),
+    }
+
+
+def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: list) -> None:
     """Append one record per transcription to transcripts.log for corpus building.
 
     Logs the raw Whisper output, the final post-processed text (so trigger/edit
-    effects are visible), and any segments the confidence gate removed with their
-    scores (so the thresholds can be audited and tuned). Best-effort; never raises.
+    effects are visible), a per-clip confidence summary (so we can see the real
+    distribution of decode confidence on actual speech), and any segments the
+    confidence gate removed with their scores (so the thresholds can be audited
+    and tuned). Best-effort; never raises.
     """
     if not LOG_TRANSCRIPTS:
         return
@@ -235,6 +265,11 @@ def _log_transcript(raw_text: str, final_text: str, info, dropped: list) -> None
             f.write(
                 f"--- {ts} | lang={info.language} dur={info.duration:.1f}s "
                 f"dropped={len(dropped)} ---\n"
+            )
+            c = _confidence_summary(kept)
+            f.write(
+                f"CONF : wlogp={c['wlogp']:.3f} minlogp={c['minlogp']:.3f} "
+                f"mean_nsp={c['mean_nsp']:.2f} segs={c['n']}\n"
             )
             f.write(f"RAW  : {raw_text!r}\n")
             if final_text != raw_text:
@@ -478,8 +513,9 @@ async def transcribe(file: UploadFile = File(...)):
         # Fast-Path Processing Layer
         text = process_transcribed_text(text)
 
-        # Corpus log: raw Whisper output, final text, and any dropped segments.
-        _log_transcript(raw_text, text, info, dropped)
+        # Corpus log: raw Whisper output, final text, per-clip confidence, and
+        # any dropped segments.
+        _log_transcript(raw_text, text, info, kept, dropped)
 
         return {"text": text, "language": info.language, "duration": info.duration}
     except Exception as e:
