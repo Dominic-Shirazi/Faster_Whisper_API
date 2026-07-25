@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from faster_whisper import WhisperModel
 import os
 import shutil
+import subprocess
 import uuid
 import uvicorn
 from dotenv import load_dotenv
@@ -40,6 +41,26 @@ COMPRESSION_RATIO_THRESHOLD = float(os.getenv("COMPRESSION_RATIO_THRESHOLD", 2.4
 # Log every raw+final transcript to transcripts.log to build a real corpus of
 # your own speech (trigger-catch coverage, hallucinations, edit results).
 LOG_TRANSCRIPTS = os.getenv("LOG_TRANSCRIPTS", "true").lower() in ("1", "true", "yes")
+
+# --- Optional background-noise denoise (experimental) -----------------------
+# When enabled, each clip is ALSO run through DeepFilterNet -- a standalone,
+# self-contained CLI (no torch, no extra Python deps, model baked in) -- and
+# transcribed a second time. Whichever pass the decoder is more confident about
+# (higher duration-weighted avg_logprob) is the one returned. Keeping the better
+# of the two means denoise can only ever help: if it scrubbed a real word, that
+# pass scores lower and the raw pass wins. Off by default; costs one extra
+# ~0.7s denoise + one extra decode per clip when on. Targets near-field-in-noise
+# (a phone call / voice memo held close in a loud room), NOT far-field competing
+# speech (a phone flat on a table), which no denoiser can separate.
+DENOISE_ENABLED = os.getenv("DENOISE_ENABLED", "false").lower() in ("1", "true", "yes")
+# Path to the deep-filter binary (download the release exe into api/bin/).
+DENOISE_BIN = os.getenv(
+    "DENOISE_BIN", os.path.join(os.path.dirname(__file__), "bin", "deep-filter.exe")
+)
+# deep-filter -a: attenuation limit in dB. 100 = full noise reduction; lower is
+# gentler (mixes some original signal back in). Full strength is safe here since
+# we keep the higher-confidence pass, but it is exposed for tuning.
+DENOISE_ATTEN_LIMIT_DB = os.getenv("DENOISE_ATTEN_LIMIT_DB", "100")
 
 # Roast (mean-mode) runs on a local reasoning model that cold-loads into VRAM
 # already occupied by Whisper, so a roast fired right after a transcription is far
@@ -247,14 +268,16 @@ def _confidence_summary(segments: list) -> dict:
     }
 
 
-def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: list) -> None:
+def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: list,
+                    denoise: str = None) -> None:
     """Append one record per transcription to transcripts.log for corpus building.
 
     Logs the raw Whisper output, the final post-processed text (so trigger/edit
     effects are visible), a per-clip confidence summary (so we can see the real
-    distribution of decode confidence on actual speech), and any segments the
-    confidence gate removed with their scores (so the thresholds can be audited
-    and tuned). Best-effort; never raises.
+    distribution of decode confidence on actual speech), an optional denoise
+    comparison line (raw vs. denoised confidence and which pass won), and any
+    segments the confidence gate removed with their scores (so the thresholds
+    can be audited and tuned). Best-effort; never raises.
     """
     if not LOG_TRANSCRIPTS:
         return
@@ -271,6 +294,8 @@ def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: l
                 f"CONF : wlogp={c['wlogp']:.3f} minlogp={c['minlogp']:.3f} "
                 f"mean_nsp={c['mean_nsp']:.2f} segs={c['n']}\n"
             )
+            if denoise:
+                f.write(f"DN   : {denoise}\n")
             f.write(f"RAW  : {raw_text!r}\n")
             if final_text != raw_text:
                 f.write(f"FINAL: {final_text!r}\n")
@@ -281,6 +306,64 @@ def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: l
                 )
     except Exception:
         pass
+
+
+def _denoise_wav(src_path: str, file_id: str) -> str:
+    """Run DeepFilterNet on src_path; return the path to the enhanced wav.
+
+    Best-effort: returns None on any failure (missing binary, non-zero exit,
+    missing output) so the caller silently falls back to the raw audio -- an
+    absent binary just means denoise is a no-op, never a broken transcription.
+    deep-filter writes <out_dir>/<basename>, so we give it a per-request out dir
+    to avoid collisions between concurrent transcriptions.
+    """
+    if not os.path.exists(DENOISE_BIN):
+        print(f"[API] Denoise skipped: binary not found at {DENOISE_BIN}")
+        return None
+    out_dir = os.path.join(TEMP_DIR, f"{file_id}_dn")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        proc = subprocess.run(
+            [DENOISE_BIN, "-a", str(DENOISE_ATTEN_LIMIT_DB), "-o", out_dir, src_path],
+            capture_output=True,
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        out_path = os.path.join(out_dir, os.path.basename(src_path))
+        if proc.returncode == 0 and os.path.exists(out_path):
+            return out_path
+        print(f"[API] Denoise failed rc={proc.returncode}: "
+              f"{proc.stderr.decode(errors='ignore')[:200]}")
+    except Exception as e:
+        print(f"[API] Denoise error: {e}")
+    return None
+
+
+def _decode(path: str) -> dict:
+    """Transcribe one wav and bundle everything the caller needs to compare passes.
+
+    Returns the info object, the kept/dropped segment split, the raw and
+    confidence-gated text, and the per-clip confidence summary -- so the raw and
+    denoised passes can be scored against each other with identical logic.
+    """
+    segments_gen, info = model.transcribe(
+        path,
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
+    segments = list(segments_gen)
+    kept, dropped = [], []
+    for s in segments:
+        (kept if _segment_is_reliable(s) else dropped).append(s)
+    return {
+        "info": info,
+        "kept": kept,
+        "dropped": dropped,
+        "raw_text": "".join(s.text for s in segments).strip(),
+        "text": "".join(s.text for s in kept).strip(),
+        "conf": _confidence_summary(kept),
+    }
 
 
 def _split_on_trigger(text: str, patterns: list) -> tuple:
@@ -493,29 +576,40 @@ async def transcribe(file: UploadFile = File(...)):
         # them, so a long thinking pause can't decode into the language prior's
         # favorite end-of-clip filler ("Thank you."). condition_on_previous_text
         # is off so a hallucination in one window can't seed the next.
-        segments_gen, info = model.transcribe(
-            temp_path,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        # Materialize once so we can inspect per-segment confidence scores.
-        segments = list(segments_gen)
+        raw = _decode(temp_path)
 
-        # Confidence gate: split into trusted vs model-distrusted segments.
-        kept, dropped = [], []
-        for s in segments:
-            (kept if _segment_is_reliable(s) else dropped).append(s)
+        # Optional best-of denoise pass. Run DeepFilterNet on the same audio,
+        # transcribe the cleaned wav, and keep whichever pass the decoder trusts
+        # more (higher weighted avg_logprob). Guarded so it can only ever help:
+        # if denoise scrubbed a real word the denoised pass scores lower and we
+        # fall back to raw. Only switch if the denoised pass actually kept speech.
+        chosen, den, dn_note = raw, None, None
+        if DENOISE_ENABLED:
+            den_path = _denoise_wav(temp_path, file_id)
+            if den_path:
+                try:
+                    den = _decode(den_path)
+                    if den["kept"] and den["conf"]["wlogp"] > raw["conf"]["wlogp"]:
+                        chosen = den
+                    winner = "DENOISED" if chosen is den else "RAW"
+                    dn_note = (f"raw_wlogp={raw['conf']['wlogp']:.3f} "
+                               f"den_wlogp={den['conf']['wlogp']:.3f} -> kept {winner}")
+                finally:
+                    shutil.rmtree(os.path.dirname(den_path), ignore_errors=True)
+            else:
+                dn_note = "enabled but denoise pass unavailable"
 
-        raw_text = "".join(s.text for s in segments).strip()
-        text = "".join(s.text for s in kept).strip()
+        info = chosen["info"]
+        raw_text = chosen["raw_text"]
+        text = chosen["text"]
 
         # Fast-Path Processing Layer
         text = process_transcribed_text(text)
 
-        # Corpus log: raw Whisper output, final text, per-clip confidence, and
-        # any dropped segments.
-        _log_transcript(raw_text, text, info, kept, dropped)
+        # Corpus log: raw Whisper output, final text, per-clip confidence, the
+        # denoise comparison (when enabled), and any dropped segments.
+        _log_transcript(raw_text, text, info, chosen["kept"], chosen["dropped"],
+                        denoise=dn_note)
 
         return {"text": text, "language": info.language, "duration": info.duration}
     except Exception as e:

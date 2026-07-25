@@ -74,6 +74,9 @@ processing_config.json
 nssm.exe
 nssm.zip
 
+# DeepFilterNet denoise binary (download the release exe locally; not vendored)
+api/bin/
+
 # Fast-path diagnostic log (runtime)
 api/fastpath.log
 # Transcript corpus (runtime) -- contains the user's actual dictated speech, private
