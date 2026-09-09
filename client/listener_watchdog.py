@@ -10,6 +10,9 @@ import json
 # State
 process = None
 running = True
+# Handle on the settings window, so a second click reuses it instead of
+# opening a rival editor for the same .env.
+settings_process = None
 
 
 def ensure_single_instance():
@@ -118,6 +121,37 @@ def on_quit(icon, item):
     icon.stop()
     os._exit(0)
 
+def open_settings(icon, item):
+    """Open the settings window as its own process.
+
+    Deliberately NOT a thread: pystray owns this process's main thread and Tk
+    requires the main thread of its own interpreter, so the two cannot share
+    one. A subprocess is the only arrangement where the tray stays responsive
+    while the window is open.
+
+    Reuses the existing window if it is already open, since two of them editing
+    the same .env would let the second one overwrite the first one's save.
+    """
+    global settings_process
+    if settings_process is not None and settings_process.poll() is None:
+        icon.notify("The settings window is already open.", "Settings")
+        return
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings_gui.py")
+    # pythonw so no console window flashes up behind the settings window.
+    python_exe = sys.executable
+    if "python.exe" in python_exe.lower():
+        pythonw = python_exe.lower().replace("python.exe", "pythonw.exe")
+        if os.path.exists(pythonw):
+            python_exe = pythonw
+    try:
+        settings_process = subprocess.Popen(
+            [python_exe, script], creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception as e:
+        print(f"[Watchdog] Could not open settings: {e}")
+        icon.notify(f"Could not open settings: {e}", "Settings")
+
+
 def restart_api(icon, item):
     print("[Watchdog] Requesting elevated restart of FasterWhisperAPI...")
     ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", "-WindowStyle Hidden -Command Restart-Service -Name FasterWhisperAPI -Force", None, 0)
@@ -167,6 +201,8 @@ def setup_tray():
     icon_image = create_tray_icon()
     menu = pystray.Menu(
         pystray.MenuItem(get_typing_mode_text, toggle_typing_mode),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem('Settings...', open_settings),
         pystray.Menu.SEPARATOR,
         # No elevation needed and it's the usual fix when backtick goes dead,
         # so it sits above the API actions (which all trigger a UAC prompt).

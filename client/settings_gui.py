@@ -1,0 +1,634 @@
+"""Settings window for the Faster-Whisper stack.
+
+Launched from the listener tray icon ("Settings..."). Edits the project's .env
+in place and offers to restart the API service so the change takes effect.
+
+Two constraints shaped this file:
+
+1. It writes .env LINE BY LINE, never by regenerating the file. That .env is
+   half configuration and half lab notebook -- the comments carry measured
+   numbers (wlogp percentiles, denoise timings, VRAM costs) that took real
+   experiments to produce. A naive dump-the-dict save would silently destroy
+   all of it, so write_env only ever replaces the value on an existing
+   `KEY=` line and leaves every other byte untouched.
+
+2. It runs as its OWN PROCESS, not a thread of the watchdog. pystray owns the
+   main thread and Tk insists on being on the main thread of its interpreter;
+   the two cannot share one. Spawning a subprocess is the only arrangement
+   where the tray stays responsive while this window is open.
+
+Zero new dependencies: stdlib tkinter only.
+"""
+
+import ctypes
+import json
+import os
+import re
+import sys
+import tkinter as tk
+from tkinter import ttk
+
+# Crisper text on high-DPI displays. Must run before any widget exists, and is
+# purely cosmetic, so a failure here is never worth crashing over.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(PROJECT_DIR, ".env")
+SERVICE_NAME = "FasterWhisperAPI"
+
+# --- Palette ---------------------------------------------------------------
+# Near-black neutrals with a single teal accent. Deliberately no purple.
+BG       = "#15171C"   # window ground
+SURFACE  = "#1B1E25"   # sidebar / footer
+RAISED   = "#222731"   # input fields
+BORDER   = "#2B313C"
+TEXT     = "#E7E9EC"
+MUTED    = "#868E9C"   # help text, secondary labels
+ACCENT   = "#2FB79A"
+ACCENT_H = "#3ACFAF"
+DANGER   = "#D9694A"
+WARN     = "#D9A441"
+
+F_BODY    = ("Segoe UI", 10)
+F_TITLE   = ("Segoe UI Semibold", 16)
+F_LABEL   = ("Segoe UI", 10)
+F_HELP    = ("Segoe UI", 8)
+F_BUTTON  = ("Segoe UI Semibold", 10)
+
+WHISPER_SIZES = [
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium",
+    "medium.en", "large-v1", "large-v2", "large-v3", "large-v3-turbo",
+    "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en",
+]
+
+# keep_alive is the one setting whose raw value is genuinely cryptic (-1 does
+# not read as "forever" to anyone), so it gets spelled out. Values are sent to
+# Ollama verbatim; -1 must stay a bare number, not a duration string.
+KEEP_ALIVE_CHOICES = [
+    ("Until unloaded manually", "-1"),
+    ("5 minutes (Ollama default)", "300"),
+    ("30 minutes", "1800"),
+    ("Unload immediately", "0"),
+]
+
+
+class Field:
+    """One editable setting: how to render it, and how to validate it."""
+
+    def __init__(self, key, label, kind, help="", choices=None,
+                 labelled_choices=None):
+        self.key = key
+        self.label = label
+        self.kind = kind          # toggle | choice | pick | text | int | float | list
+        self.help = help
+        self.choices = choices or []
+        self.labelled_choices = labelled_choices or []
+        self.var = None
+        self.widget = None
+
+    def coerce(self, raw):
+        """Return (value, error). Keeps a bad entry from ever reaching .env."""
+        raw = raw.strip()
+        if self.kind == "int":
+            try:
+                int(raw)
+            except ValueError:
+                return None, "%s: needs a whole number" % self.label
+        elif self.kind == "float":
+            try:
+                float(raw)
+            except ValueError:
+                return None, "%s: needs a number" % self.label
+        elif self.kind in ("text", "choice", "pick") and not raw:
+            return None, "%s: cannot be empty" % self.label
+        return raw, None
+
+
+SCHEMA = [
+    ("Transcription", [
+        Field("WHISPER_MODEL_SIZE", "Whisper model", "choice",
+              "Larger is more accurate and slower. Changing this downloads the "
+              "model on first use.",
+              choices=WHISPER_SIZES),
+        Field("WHISPER_DEVICE", "Compute device", "choice",
+              "cuda uses the GPU. Falls back to CPU if unavailable.",
+              choices=["cuda", "cpu", "auto"]),
+    ]),
+    ("Voice AI", [
+        Field("OLLAMA_EDIT_API_URL", "Edit endpoint", "text",
+              "Where 'prompt AI' edits are sent. Use an IP, not a hostname: the API "
+              "runs as a LocalSystem service and cannot resolve MagicDNS names."),
+        Field("OLLAMA_MODEL", "Edit model", "pick",
+              "Model used to clean up and edit dictation."),
+        Field("OLLAMA_EDIT_KEEP_ALIVE", "Keep edit model in VRAM", "pick",
+              "How long Ollama holds the model after a request. Staying loaded costs "
+              "~7.5 GB of VRAM but cuts a cold edit from ~5.5s to under 1s.",
+              labelled_choices=KEEP_ALIVE_CHOICES),
+        Field("OLLAMA_API_URL", "Mean-mode endpoint", "text",
+              "Where roast / TikTok / disses requests are sent."),
+        Field("OLLAMA_ROAST_MODEL", "Mean-mode model", "pick",
+              "Needs an uncensored model, or it will refuse to roast."),
+    ]),
+    ("Audio Corpus", [
+        Field("KEEP_AUDIO", "Keep source clips", "toggle",
+              "Archives the original audio so model A/B tests can replay real "
+              "dictation instead of synthetic audio."),
+        Field("KEEP_AUDIO_MAX", "Rolling clip limit", "int",
+              "Ordinary clips kept before the oldest is pruned. keep/ is never pruned."),
+        Field("KEEP_AUDIO_HARD_MAX", "Hard-clip limit", "int",
+              "Cap on auto-collected low-confidence clips in hard/."),
+        Field("KEEP_AUDIO_PIN_BELOW", "Hard-clip threshold", "float",
+              "Length-adjusted confidence at or below this is filed as hard. "
+              "-0.25 is roughly the worst 1 clip in 20."),
+        Field("CORPUS_TAG_TRIGGERS", "Spoken tags", "list",
+              "Say one of these while dictating and the clip is filed permanently "
+              "in keep/, named with the phrase. One per line."),
+    ]),
+    ("Denoise", [
+        Field("DENOISE_ENABLED", "Dual-pass denoise", "toggle",
+              "Transcribes each clip raw AND denoised, then keeps whichever pass the "
+              "decoder was more confident about. Roughly doubles transcription time."),
+        Field("DENOISE_ATTEN_LIMIT_DB", "Attenuation limit (dB)", "int",
+              "100 is full strength. Lower mixes some original signal back in."),
+    ]),
+    ("Service", [
+        Field("API_VISIBLE", "Show API console window", "toggle",
+              "Off runs the API silently as a background service."),
+        Field("RESTART_INTERVAL_HOURS", "Auto-restart interval (hours)", "int",
+              "NOT ACTIVE: the scheduled task that reads this was never installed on "
+              "this machine, so nothing currently restarts the API on its own."),
+        Field("LISTENER_RESTART_INTERVAL_MINS", "Listener idle restart (mins)", "int",
+              "Idle minutes before the hotkey listener recycles itself."),
+        Field("LISTEN_DELAY_SECONDS", "Listener startup delay (secs)", "int",
+              "How long the listener waits for the API on boot."),
+    ]),
+]
+
+
+# --- .env I/O --------------------------------------------------------------
+
+def read_env():
+    """Parse .env into {key: value}. Commented-out lines are deliberately ignored."""
+    values = {}
+    if not os.path.exists(ENV_PATH):
+        return values
+    with open(ENV_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)\s*=(.*)$", line)
+            if m:
+                values[m.group(1)] = m.group(2).strip()
+    return values
+
+
+def write_env(updates):
+    """Replace values in place, preserving every comment, blank line and ordering.
+
+    Only lines that are already live assignments are rewritten -- a commented
+    `# OLLAMA_EDIT_API_URL=...` fallback stays commented, because those are kept
+    on purpose as one-line revert switches. Written via a temp file + os.replace
+    so an interrupted save cannot leave a half-written .env behind.
+    """
+    with open(ENV_PATH, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    seen = set()
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)\s*=", line)
+        if m and m.group(1) in updates:
+            key = m.group(1)
+            newline = "\n" if line.endswith("\n") else ""
+            lines[i] = "%s=%s%s" % (key, updates[key], newline)
+            seen.add(key)
+
+    # A key in the schema but absent from .env (someone deleted the line) is
+    # appended rather than dropped, so saving cannot quietly lose a setting.
+    missing = [k for k in updates if k not in seen]
+    if missing:
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+        lines.append("\n# Added by the settings window\n")
+        lines.extend("%s=%s\n" % (k, updates[k]) for k in missing)
+
+    tmp = ENV_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.replace(tmp, ENV_PATH)
+
+
+def installed_ollama_models(url):
+    """Best-effort list of local Ollama models, for the model dropdowns.
+
+    Never blocks the UI for long and never raises: if Ollama is down or remote,
+    the dropdown falls back to free text with the current value intact.
+    """
+    try:
+        import urllib.request
+        base = re.sub(r"/api/.*$", "", url or "")
+        with urllib.request.urlopen(base + "/api/tags", timeout=1.5) as r:
+            data = json.load(r)
+        return sorted(m["name"] for m in data.get("models", []))
+    except Exception:
+        return []
+
+
+# --- Widgets ---------------------------------------------------------------
+
+class Toggle(tk.Canvas):
+    """A pill switch. ttk.Checkbutton cannot be themed dark on Windows without
+    fighting the native renderer, and a checkbox reads as a form; a switch reads
+    as a setting that takes effect."""
+
+    W, H = 46, 24
+
+    def __init__(self, parent, variable, command=None):
+        super().__init__(parent, width=self.W, height=self.H, bg=BG,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.var = variable
+        self.command = command
+        self._pos = 1.0 if variable.get() else 0.0
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _click(self, _event=None):
+        self.var.set(not self.var.get())
+        self._animate()
+        if self.command:
+            self.command()
+
+    def _animate(self, step=0):
+        target = 1.0 if self.var.get() else 0.0
+        self._pos += (target - self._pos) * 0.35
+        self._draw()
+        if step < 12 and abs(target - self._pos) > 0.01:
+            self.after(12, lambda: self._animate(step + 1))
+        else:
+            self._pos = target
+            self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        r = self.H // 2
+        track = self._blend("#39404E", ACCENT, self._pos)
+        # A pill is two end caps plus the span between them.
+        self.create_oval(0, 0, self.H, self.H, fill=track, outline=track)
+        self.create_oval(self.W - self.H, 0, self.W, self.H, fill=track, outline=track)
+        self.create_rectangle(r, 0, self.W - r, self.H, fill=track, outline=track)
+        knob_x = 3 + self._pos * (self.W - self.H)
+        self.create_oval(knob_x, 3, knob_x + self.H - 6, self.H - 3,
+                         fill="#F2F4F6", outline="")
+
+    @staticmethod
+    def _blend(a, b, t):
+        a = tuple(int(a[i:i + 2], 16) for i in (1, 3, 5))
+        b = tuple(int(b[i:i + 2], 16) for i in (1, 3, 5))
+        return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+class Button(tk.Label):
+    """Flat label-as-button. tk.Button on Windows draws a raised 3D chrome that
+    no amount of configuration removes."""
+
+    def __init__(self, parent, text, command, kind="ghost"):
+        self.kind = kind
+        colors = {
+            "primary": (ACCENT, "#0E1418", ACCENT_H),
+            "ghost":   (RAISED, TEXT, "#2B313C"),
+        }[kind]
+        self.bg, self.fg, self.hover = colors
+        super().__init__(parent, text=text, font=F_BUTTON, bg=self.bg, fg=self.fg,
+                         padx=18, pady=9, cursor="hand2")
+        self.command = command
+        self._enabled = True
+        self.bind("<Button-1>", self._click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _on_enter(self, _e):
+        if self._enabled:
+            self.config(bg=self.hover)
+
+    def _on_leave(self, _e):
+        if self._enabled:
+            self.config(bg=self.bg)
+
+    def _click(self, _event=None):
+        if self._enabled and self.command:
+            self.command()
+
+    def set_enabled(self, on):
+        self._enabled = on
+        self.config(fg=self.fg if on else MUTED,
+                    bg=self.bg if on else RAISED,
+                    cursor="hand2" if on else "arrow")
+
+
+class SettingsApp:
+    def __init__(self, root):
+        self.root = root
+        self.values = read_env()
+        self.dirty = False
+        self.fields = {}
+
+        root.title("Faster-Whisper Settings")
+        root.configure(bg=BG)
+        root.geometry("900x680")
+        root.minsize(780, 580)
+        self._style()
+
+        self._build_header()
+        body = tk.Frame(root, bg=BG)
+        body.pack(fill="both", expand=True)
+        self._build_footer()
+        self._build_sidebar(body)
+        self._build_content(body)
+
+        self.show_section(SCHEMA[0][0])
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _style(self):
+        s = ttk.Style()
+        try:
+            s.theme_use("clam")   # the only built-in theme that honours custom colors
+        except tk.TclError:
+            pass
+        s.configure("TCombobox", fieldbackground=RAISED, background=RAISED,
+                    foreground=TEXT, arrowcolor=MUTED, bordercolor=BORDER,
+                    lightcolor=RAISED, darkcolor=RAISED, borderwidth=0,
+                    padding=7)
+        s.map("TCombobox",
+              fieldbackground=[("readonly", RAISED)],
+              foreground=[("readonly", TEXT)],
+              arrowcolor=[("active", ACCENT)])
+        # The dropdown list is a Tk Listbox, unreachable from ttk styling.
+        self.root.option_add("*TCombobox*Listbox.background", RAISED)
+        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#0E1418")
+        self.root.option_add("*TCombobox*Listbox.font", F_BODY)
+        s.configure("Vertical.TScrollbar", background=BORDER, troughcolor=BG,
+                    bordercolor=BG, arrowcolor=MUTED, borderwidth=0)
+        # Drop the stepper arrows entirely -- clam draws them as chunky 3D
+        # buttons that date the whole window. Layout surgery is the only way;
+        # they are not a configurable option.
+        try:
+            s.layout("Vertical.TScrollbar", [
+                ("Vertical.Scrollbar.trough", {
+                    "sticky": "ns",
+                    "children": [("Vertical.Scrollbar.thumb",
+                                  {"expand": "1", "sticky": "nswe"})],
+                }),
+            ])
+        except tk.TclError:
+            pass
+
+    def _build_header(self):
+        head = tk.Frame(self.root, bg=BG)
+        head.pack(fill="x", padx=28, pady=(24, 14))
+        tk.Label(head, text="Settings", font=F_TITLE, bg=BG, fg=TEXT).pack(anchor="w")
+        tk.Label(head, text=ENV_PATH, font=F_HELP, bg=BG, fg=MUTED).pack(
+            anchor="w", pady=(2, 0))
+
+    def _build_sidebar(self, parent):
+        self.sidebar = tk.Frame(parent, bg=SURFACE, width=180)
+        self.sidebar.pack(side="left", fill="y", padx=(28, 0))
+        self.sidebar.pack_propagate(False)
+        self.nav = {}
+        for name, _ in SCHEMA:
+            row = tk.Frame(self.sidebar, bg=SURFACE, cursor="hand2")
+            row.pack(fill="x")
+            bar = tk.Frame(row, bg=SURFACE, width=3)
+            bar.pack(side="left", fill="y")
+            lbl = tk.Label(row, text=name, font=F_LABEL, bg=SURFACE, fg=MUTED,
+                           anchor="w", padx=14, pady=11)
+            lbl.pack(side="left", fill="x", expand=True)
+            for w in (row, lbl):
+                w.bind("<Button-1>", lambda e, n=name: self.show_section(n))
+            self.nav[name] = (row, bar, lbl)
+
+    def _build_content(self, parent):
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
+                               style="Vertical.TScrollbar")
+        self.inner = tk.Frame(canvas, bg=BG)
+        self.inner.bind("<Configure>",
+                        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+        self.canvas = canvas
+
+        self.frames = {}
+        models = installed_ollama_models(self.values.get("OLLAMA_API_URL", ""))
+        for name, fields in SCHEMA:
+            frame = tk.Frame(self.inner, bg=BG)
+            for f in fields:
+                self._build_field(frame, f, models)
+                self.fields[f.key] = f
+            self.frames[name] = frame
+
+    def _build_field(self, parent, field, models):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", padx=28, pady=(16, 0))
+
+        left = tk.Frame(row, bg=BG)
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(left, text=field.label, font=F_LABEL, bg=BG, fg=TEXT,
+                 anchor="w").pack(anchor="w")
+        if field.help:
+            helper = tk.Label(left, text=field.help, font=F_HELP, bg=BG, fg=MUTED,
+                              anchor="w", justify="left", wraplength=360)
+            helper.pack(anchor="w", pady=(3, 0))
+            # NOT ACTIVE / dead-config warnings earn the amber; ordinary help does not.
+            if field.help.startswith("NOT ACTIVE"):
+                helper.config(fg=WARN)
+
+        raw = self.values.get(field.key, "")
+
+        if field.kind == "toggle":
+            var = tk.BooleanVar(value=raw.strip().lower() in ("1", "true", "yes"))
+            widget = Toggle(row, var, command=self.mark_dirty)
+            widget.pack(side="right", padx=(20, 0))
+        elif field.kind in ("choice", "pick"):
+            if field.labelled_choices:
+                options = [lbl for lbl, _ in field.labelled_choices]
+                current = next((lbl for lbl, val in field.labelled_choices
+                                if val == raw), raw)
+                state = "readonly"
+            else:
+                options = list(field.choices)
+                # Live Ollama inventory beats a hardcoded list, when reachable.
+                if field.kind == "pick" and models:
+                    options = models
+                if raw and raw not in options:
+                    options.insert(0, raw)
+                current = raw
+                state = "normal"
+            var = tk.StringVar(value=current)
+            widget = ttk.Combobox(row, textvariable=var, values=options,
+                                  font=F_BODY, state=state, width=32)
+            widget.pack(side="right", padx=(20, 0))
+            var.trace_add("write", lambda *_: self.mark_dirty())
+        elif field.kind == "list":
+            var = None
+            widget = tk.Text(row, height=5, width=34, bg=RAISED, fg=TEXT,
+                             font=F_BODY, relief="flat", insertbackground=ACCENT,
+                             padx=8, pady=6, highlightthickness=1,
+                             highlightbackground=BORDER, highlightcolor=ACCENT,
+                             wrap="word")
+            widget.insert("1.0", "\n".join(
+                p.strip() for p in raw.split(",") if p.strip()))
+            widget.bind("<KeyRelease>", lambda e: self.mark_dirty())
+            widget.pack(side="right", padx=(20, 0))
+        else:
+            var = tk.StringVar(value=raw)
+            widget = tk.Entry(row, textvariable=var, font=F_BODY, bg=RAISED,
+                              fg=TEXT, relief="flat", insertbackground=ACCENT,
+                              width=34, highlightthickness=1,
+                              highlightbackground=BORDER, highlightcolor=ACCENT,
+                              borderwidth=6)
+            widget.pack(side="right", padx=(20, 0))
+            var.trace_add("write", lambda *_: self.mark_dirty())
+
+        field.var = var
+        field.widget = widget
+        tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=28, pady=(16, 0))
+
+    def _build_footer(self):
+        foot = tk.Frame(self.root, bg=SURFACE)
+        foot.pack(fill="x", side="bottom")
+        inner = tk.Frame(foot, bg=SURFACE)
+        inner.pack(fill="x", padx=28, pady=14)
+
+        self.status = tk.Label(inner, text="", font=F_BODY, bg=SURFACE, fg=MUTED,
+                               anchor="w")
+        self.status.pack(side="left", fill="x", expand=True)
+
+        self.btn_restart = Button(inner, "Save & Restart API", self.save_and_restart,
+                                  kind="primary")
+        self.btn_restart.pack(side="right")
+        self.btn_save = Button(inner, "Save", self.save, kind="ghost")
+        self.btn_save.pack(side="right", padx=(0, 10))
+        Button(inner, "Close", self.on_close, kind="ghost").pack(
+            side="right", padx=(0, 10))
+        self.set_saved_state(True)
+
+    # --- behaviour ---------------------------------------------------------
+
+    def show_section(self, name):
+        for f in self.frames.values():
+            f.pack_forget()
+        self.frames[name].pack(fill="both", expand=True)
+        for n, (row, bar, lbl) in self.nav.items():
+            active = n == name
+            bar.config(bg=ACCENT if active else SURFACE)
+            lbl.config(fg=TEXT if active else MUTED,
+                       bg=RAISED if active else SURFACE)
+            row.config(bg=RAISED if active else SURFACE)
+        self.canvas.yview_moveto(0)
+
+    def mark_dirty(self, *_):
+        if not self.dirty:
+            self.dirty = True
+            self.set_saved_state(False)
+
+    def set_saved_state(self, saved):
+        self.btn_save.set_enabled(not saved)
+        if saved:
+            self.status.config(text="", fg=MUTED)
+        else:
+            self.status.config(text="Unsaved changes", fg=WARN)
+
+    def collect(self):
+        """Gather every field, validated. Returns (updates, error)."""
+        updates = {}
+        for key, f in self.fields.items():
+            if f.kind == "toggle":
+                updates[key] = "true" if f.var.get() else "false"
+                continue
+            if f.kind == "list":
+                phrases = [p.strip() for p in
+                           f.widget.get("1.0", "end").splitlines()]
+                updates[key] = ",".join(p for p in phrases if p)
+                continue
+            raw = f.var.get()
+            if f.labelled_choices:
+                raw = next((val for lbl, val in f.labelled_choices if lbl == raw),
+                           raw)
+            value, err = f.coerce(raw)
+            if err:
+                return None, err
+            updates[key] = value
+        return updates, None
+
+    def save(self):
+        updates, err = self.collect()
+        if err:
+            self.status.config(text=err, fg=DANGER)
+            return False
+        try:
+            write_env(updates)
+        except Exception as e:
+            self.status.config(text="Could not write .env: %s" % e, fg=DANGER)
+            return False
+        self.values = read_env()
+        self.dirty = False
+        self.set_saved_state(True)
+        self.status.config(text="Saved. Restart the API to apply.", fg=ACCENT)
+        return True
+
+    def save_and_restart(self):
+        if not self.save():
+            return
+        # Same elevated path the tray menu uses: the service ACL grants
+        # Interactive Users read-only rights, so stopping it needs a UAC prompt.
+        try:
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", "powershell.exe",
+                "-WindowStyle Hidden -Command Restart-Service -Name %s -Force"
+                % SERVICE_NAME, None, 0)
+            self.status.config(
+                text="Saved. Approve the UAC prompt to restart the API.", fg=ACCENT)
+        except Exception as e:
+            self.status.config(text="Saved, but restart failed: %s" % e, fg=DANGER)
+
+    def on_close(self):
+        if self.dirty:
+            self.status.config(
+                text="Unsaved changes -- Save, or close again to discard.", fg=WARN)
+            self.dirty = False   # a second close discards, deliberately
+            return
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = SettingsApp(root)
+
+    # Deep-link straight to a section: `settings_gui.py --section "Voice AI"`.
+    # Also what the screenshot tests drive, so every panel can be checked
+    # without a human clicking through them.
+    if "--section" in sys.argv:
+        name = sys.argv[sys.argv.index("--section") + 1]
+        match = next((n for n, _ in SCHEMA if n.lower() == name.lower()), None)
+        if match:
+            app.show_section(match)
+
+    # Auto-close hook, used only by the smoke test so the GUI can be validated
+    # without a human clicking anything.
+    if "--selftest" in sys.argv:
+        root.after(1500, root.destroy)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

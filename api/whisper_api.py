@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import re
 import requests
 import json
+import math
 import time
 import traceback
 
@@ -24,6 +25,24 @@ OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434/api/generat
 # Falls back to the local Ollama if OLLAMA_EDIT_API_URL is not set.
 OLLAMA_EDIT_API_URL = os.getenv("OLLAMA_EDIT_API_URL", OLLAMA_API_URL)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M")
+
+
+def _parse_keep_alive(raw: str):
+    """Ollama's keep_alive accepts a number of seconds or a duration string
+    ("30m"). A bare "-1" must be sent as a NUMBER; the string "-1" is not a valid
+    Go duration and Ollama would reject it."""
+    raw = (raw or "").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+# How long Ollama keeps the edit model resident after a request. -1 means "until
+# unloaded manually" (`ollama stop <model>`), so only the first request after a
+# load pays for it; every later one goes straight to generating. Measured on this
+# box with qwen2.5:7b-instruct-q4_K_M: 5.5s cold vs 0.85s warm, ~7.5 GB resident.
+OLLAMA_EDIT_KEEP_ALIVE = _parse_keep_alive(os.getenv("OLLAMA_EDIT_KEEP_ALIVE", "-1"))
 OLLAMA_ROAST_MODEL = os.getenv("OLLAMA_ROAST_MODEL", "chatgpt1/qwythos-9b-claude-mythos-5-1m-abliterated:latest")
 COMPUTE_TYPE = "float16"
 TEMP_DIR = os.path.dirname(__file__)
@@ -41,6 +60,56 @@ COMPRESSION_RATIO_THRESHOLD = float(os.getenv("COMPRESSION_RATIO_THRESHOLD", 2.4
 # Log every raw+final transcript to transcripts.log to build a real corpus of
 # your own speech (trigger-catch coverage, hallucinations, edit results).
 LOG_TRANSCRIPTS = os.getenv("LOG_TRANSCRIPTS", "true").lower() in ("1", "true", "yes")
+
+# --- Rolling audio corpus ---------------------------------------------------
+# transcripts.log records what the model HEARD but the audio was deleted on every
+# request, so a model comparison could never be re-run against real speech -- the
+# first 762 clips are gone. Keep the last N source clips (the original upload, not
+# the denoised copy: an A/B needs the same input the current model got) so
+# distil-large-v3.5 / large-v3-turbo / parakeet can be scored on actual dictation
+# instead of synthetic audio. Bounded by count, so it cannot grow forever.
+# Filenames carry the timestamp, clip duration and wlogp, which makes the hard
+# clips greppable: `ls audio_corpus | grep wlogp-0.2` finds the low-confidence ones.
+# Anything moved into audio_corpus/keep/ is NEVER pruned -- that is where the
+# outdoor / crowd / restaurant recordings go once you spot a good one.
+KEEP_AUDIO = os.getenv("KEEP_AUDIO", "true").lower() in ("1", "true", "yes")
+KEEP_AUDIO_MAX = int(os.getenv("KEEP_AUDIO_MAX", 100))
+AUDIO_CORPUS_DIR = os.path.join(TEMP_DIR, "audio_corpus")
+AUDIO_KEEP_DIR = os.path.join(AUDIO_CORPUS_DIR, "keep")
+AUDIO_HARD_DIR = os.path.join(AUDIO_CORPUS_DIR, "hard")
+# Say one of these while dictating and the clip is filed permanently in keep/,
+# named with the phrase, so a condition can be labelled by voice in the moment
+# ("loud in here" in a restaurant) and grepped for later. The matched phrase is
+# the label -- add a category by adding a phrase, no code change. Kept out of the
+# 'prompt ai' trigger family on purpose: those rewrite the text, these only file
+# the audio and leave the transcript alone.
+CORPUS_TAG_TRIGGERS = [
+    p.strip() for p in os.getenv(
+        "CORPUS_TAG_TRIGGERS",
+        "tag this clip,loud in here,restaurant test,outdoor test,crowd test,loud",
+    ).split(",") if p.strip()
+]
+# Auto-pin clips the decoder struggled on into hard/, since the conditions worth
+# collecting are exactly the ones where a spoken trigger is most likely to be
+# misheard. -0.25 is the 5th percentile of 414 real logged clips (median -0.128,
+# p10 -0.199, worst -0.701) -- roughly 1 clip in 20, so hard/ fills slowly.
+KEEP_AUDIO_PIN_BELOW = float(os.getenv("KEEP_AUDIO_PIN_BELOW", -0.25))
+KEEP_AUDIO_HARD_MAX = int(os.getenv("KEEP_AUDIO_HARD_MAX", 50))
+# ...but wlogp is not a difficulty signal on its own: it rises with utterance
+# length. Over the 54 clips logged 2026-08-06 corr(duration, wlogp) was +0.55 and
+# the bucket means climbed monotonically -- -0.317 under 5s, -0.242 at 5-15s,
+# -0.198 at 15-30s, -0.175 over 30s. Pinning the raw value therefore fills hard/
+# with clips that are merely SHORT: 19 of the 21 auto-pinned that night were,
+# while the genuinely adversarial ones (moving car, music over bluetooth, FM
+# radio, mixed mic distance) averaged -0.169 -- BETTER than quiet dictation --
+# and were never collected at all. A corpus of short clips is the one thing a
+# noise A/B cannot use.
+# So restate each clip's score as if it were REF_DUR seconds long before
+# comparing it to the threshold. The slope is ~0.05 wlogp per natural-log unit
+# of duration, measured off those same buckets. A 3s clip is then graded against
+# short-clip expectations and a 45s clip against long-clip ones.
+KEEP_AUDIO_PIN_REF_DUR = float(os.getenv("KEEP_AUDIO_PIN_REF_DUR", 15.0))
+KEEP_AUDIO_PIN_DUR_SLOPE = float(os.getenv("KEEP_AUDIO_PIN_DUR_SLOPE", 0.05))
 
 # --- Optional background-noise denoise (experimental) -----------------------
 # When enabled, each clip is ALSO run through DeepFilterNet -- a standalone,
@@ -61,6 +130,15 @@ DENOISE_BIN = os.getenv(
 # gentler (mixes some original signal back in). Full strength is safe here since
 # we keep the higher-confidence pass, but it is exposed for tuning.
 DENOISE_ATTEN_LIMIT_DB = os.getenv("DENOISE_ATTEN_LIMIT_DB", "100")
+# Denoise subprocess timeout, as a multiple of the clip's own duration plus a
+# fixed floor for model load. deep-filter runs ~10x realtime on an idle box, but
+# this machine also serves Ollama, so under CPU contention a long clip could blow
+# through the old flat 60s cap. Scaling with duration means a 4-minute clip gets
+# 4 minutes of headroom and only a genuinely hung process trips it. (This was a
+# suspect for the first trial's 39% silent-failure rate, but the actual cause
+# turned out to be non-WAV input -- see _denoise_wav. Kept as cheap insurance.)
+DENOISE_TIMEOUT_FLOOR_SEC = float(os.getenv("DENOISE_TIMEOUT_FLOOR_SEC", 60))
+DENOISE_TIMEOUT_RATIO = float(os.getenv("DENOISE_TIMEOUT_RATIO", 1.0))
 
 # Roast (mean-mode) runs on a local reasoning model that cold-loads into VRAM
 # already occupied by Whisper, so a roast fired right after a transcription is far
@@ -269,7 +347,7 @@ def _confidence_summary(segments: list) -> dict:
 
 
 def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: list,
-                    denoise: str = None) -> None:
+                    denoise: str = None, audio: str = "") -> None:
     """Append one record per transcription to transcripts.log for corpus building.
 
     Logs the raw Whisper output, the final post-processed text (so trigger/edit
@@ -296,6 +374,11 @@ def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: l
             )
             if denoise:
                 f.write(f"DN   : {denoise}\n")
+            # The bridge from text back to audio. Without it the log and the
+            # corpus are two unrelated piles: you can grep a phrase you remember
+            # saying, but never get to the recording of it.
+            if audio:
+                f.write(f"AUDIO: {audio}\n")
             f.write(f"RAW  : {raw_text!r}\n")
             if final_text != raw_text:
                 f.write(f"FINAL: {final_text!r}\n")
@@ -308,35 +391,264 @@ def _log_transcript(raw_text: str, final_text: str, info, kept: list, dropped: l
         pass
 
 
-def _denoise_wav(src_path: str, file_id: str) -> str:
-    """Run DeepFilterNet on src_path; return the path to the enhanced wav.
+def _spoken_tag(text: str) -> str:
+    """Return a filename-safe slug for the first CORPUS_TAG phrase heard, else "".
 
-    Best-effort: returns None on any failure (missing binary, non-zero exit,
-    missing output) so the caller silently falls back to the raw audio -- an
-    absent binary just means denoise is a no-op, never a broken transcription.
-    deep-filter writes <out_dir>/<basename>, so we give it a per-request out dir
-    to avoid collisions between concurrent transcriptions.
+    Lets a clip label itself out loud: say "loud in here" while dictating in a
+    restaurant and the clip lands in keep/ named with that tag, so months later
+    `ls keep | grep loud-in-here` finds every one. The matched phrase IS the
+    label, so adding a new category is just adding a phrase to the .env list --
+    no code change.
+
+    The phrase is deliberately NOT stripped from the transcript. Removing words
+    the model actually heard is the one thing this pipeline refuses to do; a
+    stray tag in the text is a far smaller cost than a filter that can eat real
+    dictation.
+    """
+    for phrase in CORPUS_TAG_TRIGGERS:
+        if re.search(r"\b" + re.escape(phrase) + r"\b", text, flags=re.IGNORECASE):
+            return re.sub(r"[^a-z0-9]+", "-", phrase.lower()).strip("-")
+    return ""
+
+
+def _length_adjusted_wlogp(wlogp: float, duration: float) -> float:
+    """Restate wlogp as if the clip had been KEEP_AUDIO_PIN_REF_DUR seconds long.
+
+    Expected confidence rises with length (~KEEP_AUDIO_PIN_DUR_SLOPE per
+    natural-log unit of duration), so comparing a 2s clip and a 45s clip against
+    one fixed threshold compares them against different implicit standards.
+    Subtracting the length term removes that, leaving a number that means the
+    same thing at every duration.
+
+    Short clips are graded up and long clips down, which is the intended effect
+    in both directions: -0.30 on a 2s fragment is ordinary, while -0.30 across
+    45s of continuous speech is genuinely unusual and worth keeping.
+
+    Setting KEEP_AUDIO_PIN_DUR_SLOPE=0 restores the old raw-wlogp behaviour.
+    """
+    if wlogp == 0.0 or duration <= 0 or KEEP_AUDIO_PIN_DUR_SLOPE == 0:
+        return wlogp
+    return wlogp - KEEP_AUDIO_PIN_DUR_SLOPE * math.log(
+        duration / KEEP_AUDIO_PIN_REF_DUR
+    )
+
+
+def _prune_dir(path: str, cap: int) -> None:
+    """Trim a corpus folder to its newest `cap` files. Subfolders are never touched."""
+    clips = sorted(f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f)))
+    for stale in clips[:max(0, len(clips) - cap)]:
+        try:
+            os.remove(os.path.join(path, stale))
+        except OSError:
+            pass
+
+
+def _archive_audio(src_path: str, orig_name: str, info, conf: dict,
+                   raw_text: str = "") -> str:
+    """File one source clip into the corpus and return its path relative to it.
+
+    Archives the ORIGINAL upload, never the denoised copy -- a model A/B has to
+    replay the same bytes the current model was given. The original extension is
+    preserved because the client does not always send WAV (the Android path sends
+    a compressed container), and re-testing has to reproduce that exact input.
+
+    Three destinations, by intent:
+      keep/  -- a CORPUS_TAG phrase was spoken. Deliberate, so it is permanent
+                and never pruned. This is also the folder you drag clips into
+                by hand.
+      hard/  -- length-adjusted wlogp at or below KEEP_AUDIO_PIN_BELOW (see
+                _length_adjusted_wlogp: raw wlogp would pin short clips, not
+                difficult ones), i.e. the decoder
+                struggled. Auto-detected rather than chosen, so it is capped
+                (KEEP_AUDIO_HARD_MAX) and cannot grow forever. Catches the
+                noisy clips a spoken trigger would miss -- in the exact
+                conditions worth capturing, the trigger word is the thing most
+                likely to be misheard, so confidence is the more reliable
+                signal.
+      root   -- everything else, rolling window of KEEP_AUDIO_MAX.
+
+    The name encodes timestamp, duration, confidence and tag:
+        20260805-160331_dur65.2s_wlogp-0.138_tag-loud-in-here_a1b2c3d4.wav
+    The timestamp prefix sorts chronologically as plain text, which is what the
+    prune relies on -- mtime would be rewritten by a file copy or a sync tool
+    and silently reorder the corpus.
+
+    Best-effort: an archiving failure must never fail a transcription.
+    """
+    if not KEEP_AUDIO:
+        return ""
+    try:
+        for d in (AUDIO_CORPUS_DIR, AUDIO_KEEP_DIR, AUDIO_HARD_DIR):
+            os.makedirs(d, exist_ok=True)
+
+        tag = _spoken_tag(raw_text)
+        wlogp = conf.get("wlogp", 0.0)
+        duration = getattr(info, "duration", 0.0)
+        # wlogp == 0.0 is _confidence_summary's empty sentinel (no kept segments),
+        # not a perfect decode -- it must not read as "confident" and skip the pin.
+        # It is also checked BEFORE the length adjustment: an empty transcript is a
+        # real failure at any duration, and the 2.4s silent-failure clip on
+        # 2026-08-06 is exactly the case that must never be normalised away.
+        is_hard = (
+            wlogp == 0.0
+            or _length_adjusted_wlogp(wlogp, duration) <= KEEP_AUDIO_PIN_BELOW
+        )
+
+        if tag:
+            dest, cap, sub = AUDIO_KEEP_DIR, None, "keep"
+        elif is_hard:
+            dest, cap, sub = AUDIO_HARD_DIR, KEEP_AUDIO_HARD_MAX, "hard"
+        else:
+            dest, cap, sub = AUDIO_CORPUS_DIR, KEEP_AUDIO_MAX, ""
+
+        name = (
+            f"{time.strftime('%Y%m%d-%H%M%S')}"
+            f"_dur{duration:.1f}s"
+            f"_wlogp{wlogp:.3f}"
+            + (f"_tag-{tag}" if tag else "")
+            + f"_{uuid.uuid4().hex[:8]}{os.path.splitext(orig_name)[1] or '.wav'}"
+        )
+        shutil.copy2(src_path, os.path.join(dest, name))
+        if cap is not None:
+            _prune_dir(dest, cap)
+        return f"{sub}/{name}" if sub else name
+    except Exception as e:
+        print(f"[API] Audio archive failed (transcription unaffected): {e}")
+        return ""
+
+
+def _is_riff_wave(path: str) -> bool:
+    """True if the file's own bytes are a RIFF/WAVE container.
+
+    Checked by content, not extension: deep-filter sniffs content too (WAV bytes
+    named .m4a denoise fine), so the extension tells us nothing useful.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+        return head[:4] == b"RIFF" and head[8:12] == b"WAVE"
+    except Exception:
+        return False
+
+
+def _transcode_to_wav(src_path: str, dst_path: str, rate: int = 48000):
+    """Decode any audio container to mono 16-bit WAV at `rate`. (ok, reason).
+
+    Uses PyAV, which faster-whisper already depends on and already has loaded --
+    so this adds no dependency and no new binary. 48k is DeepFilterNet's native
+    rate, so it does no resampling of its own. Imported locally so a broken or
+    missing av can only ever disable denoise, never take down the API at import.
+    """
+    try:
+        import av
+        import numpy as np
+        import wave as wave_mod
+
+        chunks = []
+        with av.open(src_path) as container:
+            if not container.streams.audio:
+                return False, "no audio stream in file"
+            resampler = av.AudioResampler(format="s16", layout="mono", rate=rate)
+            for frame in container.decode(container.streams.audio[0]):
+                for out in resampler.resample(frame):
+                    chunks.append(out.to_ndarray())
+            # Flush whatever the resampler is still holding.
+            try:
+                for out in resampler.resample(None):
+                    chunks.append(out.to_ndarray())
+            except Exception:
+                pass
+
+        if not chunks:
+            return False, "decoded to zero audio frames"
+
+        data = np.concatenate(chunks, axis=1)[0].astype("<i2")
+        with wave_mod.open(dst_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(data.tobytes())
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _denoise_wav(src_path: str, file_id: str, duration: float = 0.0):
+    """Run DeepFilterNet on src_path. Returns (out_path, failure_reason).
+
+    Exactly one of the two is None. Best-effort: any failure (missing binary,
+    non-zero exit, panic, timeout, missing output) yields (None, reason) so the
+    caller falls back to the raw audio -- an absent binary is a no-op, never a
+    broken transcription. deep-filter writes <out_dir>/<basename>, so we give it
+    a per-request out dir to avoid collisions between concurrent transcriptions.
+
+    The reason string is surfaced into transcripts.log rather than only printed.
+    The first trial logged a flat "denoise pass unavailable" for 39% of clips
+    with the real cause going to a service stdout nobody reads, which made the
+    failure undiagnosable after the fact -- and deep-filter is perfectly
+    informative when asked (it reports e.g. a hound WAV parse error, or panics
+    with 'TooWide' on 32-bit PCM). Costs nothing to keep.
     """
     if not os.path.exists(DENOISE_BIN):
-        print(f"[API] Denoise skipped: binary not found at {DENOISE_BIN}")
-        return None
+        return None, f"binary not found at {DENOISE_BIN}"
+
     out_dir = os.path.join(TEMP_DIR, f"{file_id}_dn")
+    # Scale the cap with clip length; see DENOISE_TIMEOUT_* above.
+    timeout = DENOISE_TIMEOUT_FLOOR_SEC + DENOISE_TIMEOUT_RATIO * max(duration, 0.0)
+    started = time.time()
+    pre_path = None
     try:
+        # deep-filter's WAV reader (hound) accepts nothing else, so a compressed
+        # upload dies instantly with "Ill-formed WAVE file: no RIFF tag found".
+        # Whisper decodes those happily via PyAV, so transcription looked fine
+        # while the denoise pass silently never ran -- which is what the Android
+        # app hit on every single clip during the first trial. Normalise first.
+        feed_path = src_path
+        if not _is_riff_wave(src_path):
+            pre_path = os.path.join(TEMP_DIR, f"{file_id}_pre.wav")
+            ok, err = _transcode_to_wav(src_path, pre_path)
+            if not ok:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                return None, f"input is not WAV and transcode failed: {err}"
+            feed_path = pre_path
+
         os.makedirs(out_dir, exist_ok=True)
         proc = subprocess.run(
-            [DENOISE_BIN, "-a", str(DENOISE_ATTEN_LIMIT_DB), "-o", out_dir, src_path],
+            [DENOISE_BIN, "-a", str(DENOISE_ATTEN_LIMIT_DB), "-o", out_dir, feed_path],
             capture_output=True,
-            timeout=60,
+            timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        out_path = os.path.join(out_dir, os.path.basename(src_path))
+        elapsed = time.time() - started
+        out_path = os.path.join(out_dir, os.path.basename(feed_path))
         if proc.returncode == 0 and os.path.exists(out_path):
-            return out_path
-        print(f"[API] Denoise failed rc={proc.returncode}: "
-              f"{proc.stderr.decode(errors='ignore')[:200]}")
+            return out_path, None
+
+        err = (proc.stderr or b"").decode(errors="ignore").strip().replace("\n", " ")
+        if proc.returncode == 0:
+            reason = f"exit 0 but no output file after {elapsed:.1f}s"
+        else:
+            reason = f"exit {proc.returncode} after {elapsed:.1f}s: {err[:180]}"
+    except subprocess.TimeoutExpired:
+        reason = f"timed out after {timeout:.0f}s (clip {duration:.1f}s)"
     except Exception as e:
-        print(f"[API] Denoise error: {e}")
-    return None
+        reason = f"{type(e).__name__}: {e}"
+    finally:
+        # The transcoded copy is scratch either way -- the caller only ever needs
+        # deep-filter's output. Removed on the success path too, which is why
+        # this is a finally and not part of the failure cleanup below.
+        if pre_path and os.path.exists(pre_path):
+            try:
+                os.remove(pre_path)
+            except OSError:
+                pass
+
+    # Cleanup on EVERY failure path. out_dir is created before the run, so the
+    # old code leaked one empty directory per failure -- 100 of them had piled
+    # up in api/ by the end of the first trial.
+    shutil.rmtree(out_dir, ignore_errors=True)
+    print(f"[API] Denoise failed: {reason}")
+    return None, reason
 
 
 def _decode(path: str) -> dict:
@@ -477,7 +789,10 @@ def process_transcribed_text(text: str) -> str:
     if trigger_list:
         trigger_pattern = r"\b(" + "|".join(trigger_list) + r")\b"
         if re.search(trigger_pattern, text, flags=re.IGNORECASE):
-            print(f"[API] Trigger word found, processing via Ollama ({OLLAMA_MODEL} @ {OLLAMA_EDIT_API_URL})...")
+            print(
+                f"[API] Trigger word found, processing via Ollama "
+                f"({OLLAMA_MODEL} @ {OLLAMA_EDIT_API_URL}, keep_alive={OLLAMA_EDIT_KEEP_ALIVE})..."
+            )
 
             # Strip the trigger in code and separate the spoken directions from the
             # content, so neither can leak into the output (see _split_on_trigger).
@@ -503,7 +818,8 @@ def process_transcribed_text(text: str) -> str:
                 return ""
 
             _fastlog(
-                f"EDIT trigger fired -> POST {OLLAMA_EDIT_API_URL} model={OLLAMA_MODEL} | "
+                f"EDIT trigger fired -> POST {OLLAMA_EDIT_API_URL} model={OLLAMA_MODEL} "
+                f"keep_alive={OLLAMA_EDIT_KEEP_ALIVE} | "
                 f"content={content!r} instruction={instruction!r}"
             )
             try:
@@ -541,6 +857,9 @@ def process_transcribed_text(text: str) -> str:
                         # 0.8 which invites the model to drift, invent, and add
                         # preambles. 0.2 keeps it close to the dictated text.
                         "options": {"temperature": 0.2},
+                        # Pin the model in VRAM (see OLLAMA_EDIT_KEEP_ALIVE) so an
+                        # edit fired hours after the last one is still warm.
+                        "keep_alive": OLLAMA_EDIT_KEEP_ALIVE,
                     },
                     timeout=60,
                 )
@@ -585,19 +904,30 @@ async def transcribe(file: UploadFile = File(...)):
         # fall back to raw. Only switch if the denoised pass actually kept speech.
         chosen, den, dn_note = raw, None, None
         if DENOISE_ENABLED:
-            den_path = _denoise_wav(temp_path, file_id)
+            # Pass the clip's real duration so the subprocess cap scales with it.
+            den_path, dn_fail = _denoise_wav(
+                temp_path, file_id, getattr(raw["info"], "duration", 0.0)
+            )
             if den_path:
                 try:
                     den = _decode(den_path)
                     if den["kept"] and den["conf"]["wlogp"] > raw["conf"]["wlogp"]:
                         chosen = den
                     winner = "DENOISED" if chosen is den else "RAW"
+                    # A denoised pass that kept no segments scores 0.000 from
+                    # _confidence_summary([]) -- which reads as "better" than any
+                    # negative logprob. Label it so the log can't be misread as a
+                    # denoise win, and so analysis can exclude it: it is a total
+                    # denoise failure (all speech scrubbed) that the guard caught,
+                    # not a real comparison.
+                    if not den["kept"]:
+                        winner += " (denoised pass kept no speech)"
                     dn_note = (f"raw_wlogp={raw['conf']['wlogp']:.3f} "
                                f"den_wlogp={den['conf']['wlogp']:.3f} -> kept {winner}")
                 finally:
                     shutil.rmtree(os.path.dirname(den_path), ignore_errors=True)
             else:
-                dn_note = "enabled but denoise pass unavailable"
+                dn_note = f"unavailable -- {dn_fail}"
 
         info = chosen["info"]
         raw_text = chosen["raw_text"]
@@ -608,8 +938,15 @@ async def transcribe(file: UploadFile = File(...)):
 
         # Corpus log: raw Whisper output, final text, per-clip confidence, the
         # denoise comparison (when enabled), and any dropped segments.
+        # Archive BEFORE logging so the log can name the file it produced --
+        # that AUDIO line is what turns "I remember saying this somewhere loud"
+        # into the actual recording. Tag detection runs on the raw text, before
+        # process_transcribed_text can rewrite a trigger phrase out of it.
+        archived = _archive_audio(temp_path, file.filename or "clip.wav", info,
+                                  chosen["conf"], raw_text)
+
         _log_transcript(raw_text, text, info, chosen["kept"], chosen["dropped"],
-                        denoise=dn_note)
+                        denoise=dn_note, audio=archived)
 
         return {"text": text, "language": info.language, "duration": info.duration}
     except Exception as e:
